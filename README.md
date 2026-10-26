@@ -71,7 +71,9 @@ The installer validates the plugin, installs the packages above, copies the plug
 | `./install.sh --update` | not touched (warns if missing) | files refreshed in place | kept |
 | `./install.sh --replace` | installed if missing | moved to a hidden `.rmarchei.openvpn.backup.*` folder, then reinstalled | reset to the right section, after the tray |
 
-After `git pull`, run `./install.sh --update`. A copy installed with `omarchy plugin add` is a git checkout; update that one with `omarchy plugin update rmarchei.openvpn` instead.
+After `git pull`, run `./install.sh --update --restart`. A copy installed with `omarchy plugin add` is a git checkout; update that one with `omarchy plugin update rmarchei.openvpn` instead.
+
+The shell notices changed plugin files and rebuilds the widget, but it rebuilds it from Qt's cached copy of the old QML, so panel changes only appear after `omarchy restart shell`. `--restart` (accepted with any mode) runs that for you. Backend changes in `scripts/openvpn-plugin` apply immediately, because the panel starts the backend fresh on every call.
 
 ## Usage
 
@@ -137,10 +139,11 @@ The backend can be run on its own:
 scripts/openvpn-plugin list --config-dir ~/.config/openvpn
 ```
 
-For live development, install once, then push each change into the user plugin directory. The shell reloads on save.
+For live development, install once, then push each change into the user plugin directory. Add `--restart` whenever `Panel.qml` changed:
 
 ```bash
-./install.sh --update
+./install.sh --update            # backend-only changes
+./install.sh --update --restart  # Panel.qml changes
 ```
 
 ## Uninstallation

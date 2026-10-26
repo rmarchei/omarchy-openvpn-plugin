@@ -2,13 +2,15 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: ./install.sh [--replace | --update]"
+  echo "Usage: ./install.sh [--replace | --update] [--restart]"
   echo "--replace  back up an existing installation, then install it again from scratch."
   echo "--update   refresh the files of an existing installation in place: no packages,"
   echo "           no backup, and the widget stays where it is on the bar."
+  echo "--restart  restart the Omarchy shell afterwards so it loads the new version."
 }
 
 MODE=install
+RESTART=0
 for argument in "$@"; do
   case "$argument" in
     --replace|--update)
@@ -18,6 +20,7 @@ for argument in "$@"; do
       fi
       MODE=${argument#--}
       ;;
+    --restart) RESTART=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "install.sh: unknown option: $argument" >&2; exit 1 ;;
   esac
@@ -38,6 +41,17 @@ copy_plugin_files() {
     mv -f -- "$DESTINATION/$file.new" "$DESTINATION/$file"
   done
   chmod +x "$DESTINATION/scripts/openvpn-plugin"
+}
+
+# The shell's hot reload keeps serving an already loaded plugin's old QML (it
+# cannot clear Qt's component cache), so changed files only show after a restart.
+finish() {
+  if (( RESTART )); then
+    echo "Restarting the Omarchy shell..."
+    omarchy restart shell
+  elif [[ $MODE != install ]]; then
+    echo "Restart the shell to load the new version: omarchy restart shell (or rerun with --restart)"
+  fi
 }
 
 omarchy plugin validate "$SOURCE_DIR"
@@ -64,6 +78,7 @@ if [[ $MODE == update ]]; then
     echo "Some dependencies are missing; install them with: omarchy pkg add ${PACKAGES[*]}"
   fi
   echo "OpenVPN Profiles updated in place."
+  finish
   exit 0
 fi
 
@@ -91,3 +106,4 @@ omarchy-shell shell rescanPlugins
 omarchy plugin enable "$PLUGIN_ID" --section right
 
 echo "OpenVPN Profiles installed. Configure its directory from the Omarchy bar settings."
+finish

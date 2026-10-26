@@ -792,16 +792,20 @@ def copy_private(source: BinaryIO, target: Path) -> None:
         shutil.copyfileobj(source, stream)
 
 
-def profile_references(path: Path) -> list[str]:
-    """Return the relative file references of a profile that must travel with it."""
+def file_references(path: Path) -> list[str]:
+    """Return every file a profile references, as written in it."""
     references = []
     text = read_text(path) or ""
     for raw_line in text.splitlines():
         tokens = tokenize(raw_line.strip()) if raw_line.strip()[:1] not in {"#", ";", "<"} else []
         if len(tokens) > 1 and tokens[0].removeprefix("--") in FILE_DIRECTIVES and tokens[1] != "[inline]":
-            if not expand_path(tokens[1]).is_absolute():
-                references.append(tokens[1])
+            references.append(tokens[1])
     return references
+
+
+def profile_references(path: Path) -> list[str]:
+    """Return the relative file references of a profile that must travel with it."""
+    return [reference for reference in file_references(path) if not expand_path(reference).is_absolute()]
 
 
 def staging_directory(directory: Path) -> Path:
@@ -1023,9 +1027,9 @@ def owned_references(path: Path) -> set[Path]:
 
 def delete_profile_files(path: Path, directory: Path) -> None:
     """Delete a profile and the files only it uses; never anything outside its folder."""
-    folder = path.parent
-    others = [item for item in folder.iterdir() if item != path and not item.name.startswith(".") and item.is_file() and item.suffix.lower() in SUPPORTED_SUFFIXES]
-    still_used = set().union(*(owned_references(other) for other in others))
+    # Any profile in the directory may share a file, including one in another folder that reaches it with ../.
+    others = [other for other in discover(directory) if other != path]
+    still_used = {resolve_reference(other.parent, reference).resolve() for other in others for reference in file_references(other)}
     deleted = sorted(owned_references(path) - still_used - {path}) + [path]
     for target in deleted:
         target.unlink(missing_ok=True)

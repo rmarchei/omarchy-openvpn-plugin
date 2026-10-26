@@ -447,6 +447,15 @@ class DeleteTests(TempDirTestCase):
         self.delete(first)
         self.assertEqual(self.files(), ["ca.crt", "site", "site/b.ovpn", "site/shared.key"])
 
+    def test_files_used_by_profiles_in_other_folders_are_kept(self):
+        self.write("profiles/ca.crt", "CA")
+        self.write("profiles/ta.key", "TA")
+        top = self.write("profiles/top.ovpn", CLIENT + "ca ca.crt\ntls-auth ta.key\n")
+        self.write("profiles/site/a.ovpn", CLIENT + "ca ../ca.crt\n")
+        self.write("profiles/lab/b.ovpn", CLIENT + f"tls-auth {self.profiles / 'ta.key'}\n")
+        self.delete(top)
+        self.assertEqual(self.files(), ["ca.crt", "lab", "lab/b.ovpn", "site", "site/a.ovpn", "ta.key"])
+
     def test_refuses_profiles_outside_the_profiles_directory(self):
         outside = self.write("Downloads/vpn.ovpn", CLIENT)
         deep = self.write("profiles/a/b/vpn.ovpn", CLIENT)

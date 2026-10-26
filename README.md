@@ -121,7 +121,7 @@ Middle-click the bar icon, or press `r` in the panel, to refresh.
 | Delete (click twice) | profile is disconnected |
 | Disconnect | profile is connected or connecting |
 
-**Delete** removes the NetworkManager connection, the profile's keyring secrets, its custom name, the certificate files NetworkManager extracted for it, and the profile file itself. It also removes the certificate and key files the profile references from its own folder, unless another profile in that folder still uses them, and then the folder if that leaves it empty. Unrelated files in the folder and anything outside the profile directory are never touched.
+**Delete** removes the NetworkManager connection, the profile's keyring secrets, its custom name, the certificate files NetworkManager extracted for it, and the profile file itself. It also removes the certificate and key files the profile references from its own folder, unless another profile in the profile directory still uses them, and then the folder if that leaves it empty. Unrelated files in the folder and anything outside the profile directory are never touched.
 
 ### IPC
 

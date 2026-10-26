@@ -134,20 +134,51 @@ class DiscoveryTests(TempDirTestCase):
         self.assertEqual(module.default_name(self.root / "client.ovpn", self.root), "client")
         self.assertEqual(module.default_name(self.root / "office" / "berlin.ovpn", self.root), "berlin")
 
-    def test_create_directory_is_private_and_idempotent(self):
-        target = self.root / "config" / "openvpn"
-        args = type("Args", (), {"config_dir": str(target)})()
-        for _attempt in range(2):
-            with patch("sys.stdout", io.StringIO()) as output, self.assertRaises(SystemExit):
-                module.command_create_directory(args)
-            self.assertTrue(json.loads(output.getvalue())["ok"])
-        self.assertTrue(target.is_dir())
-        self.assertEqual(target.stat().st_mode & 0o077, 0)
+    def run_list(self, directory):
+        with (
+            patch.object(module, "load_state", return_value={}),
+            patch.object(module, "nm_connections", return_value={}),
+            patch.object(module, "stored_secret_index", return_value={}),
+            patch("sys.stdout", io.StringIO()) as output,
+            self.assertRaises(SystemExit),
+        ):
+            module.command_list(type("Args", (), {"config_dir": str(directory)})())
+        return json.loads(output.getvalue())
 
-    def test_create_directory_refuses_to_replace_a_file(self):
+    def test_list_creates_a_missing_directory_privately(self):
+        target = self.root / "config" / "openvpn"
+        for _attempt in range(2):
+            self.assertEqual(self.run_list(target)["profiles"], [])
+        self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+
+    def test_list_refuses_a_file_where_the_directory_should_be(self):
         target = self.write("openvpn")
         with self.assertRaisesRegex(module.WidgetError, "is not a directory"):
-            module.command_create_directory(type("Args", (), {"config_dir": str(target)})())
+            module.command_list(type("Args", (), {"config_dir": str(target)})())
+
+    def test_list_makes_profiles_and_their_files_owner_only(self):
+        profiles = self.root / "profiles"
+        key = self.write("profiles/office/certs/client.key", PLAIN_PEM)
+        notes = self.write("profiles/office/notes.txt", "keep my mode")
+        outside = self.write("shared-ca.crt", "CA")
+        profile = self.write("profiles/office/client.ovpn", CLIENT + f"key certs/client.key\nca {outside}\n")
+        flat = self.write("profiles/home.ovpn", CLIENT)
+        (profiles / "link.ovpn").symlink_to(outside)
+        for path, mode in ((profiles, 0o755), (profiles / "office", 0o755), (key.parent, 0o755), (key, 0o644),
+                           (notes, 0o644), (outside, 0o644), (profile, 0o755), (flat, 0o664)):
+            path.chmod(mode)
+
+        self.run_list(profiles)
+
+        def mode(path):
+            return path.stat().st_mode & 0o777
+
+        self.assertEqual(
+            [mode(path) for path in (profiles, profiles / "office", key.parent, key, profile, flat)],
+            [0o700, 0o700, 0o700, 0o600, 0o700, 0o600],
+        )
+        # Unreferenced files, files outside the directory and symlink targets keep their modes.
+        self.assertEqual([mode(notes), mode(outside)], [0o644, 0o644])
 
     def test_config_key_is_stable(self):
         path = self.write("vpn.ovpn")
@@ -231,7 +262,7 @@ class ImportTests(TempDirTestCase):
         self.assertEqual(blobs, [blob])
         self.assertFalse(alias.exists() or alias.is_symlink())
 
-    def test_forget_only_removes_files_written_for_this_profile(self):
+    def test_blob_cleanup_only_removes_files_written_for_this_profile(self):
         path = self.write("office/client.ovpn", CLIENT)
         prefix = module.import_alias(path).stem
         own = self.write(f"certs/{prefix}-key.pem", "KEY")
@@ -306,6 +337,72 @@ class ConnectTests(TempDirTestCase):
             ):
                 module.command_connect(args)
             run.assert_not_called()
+
+
+class DeleteTests(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.profiles = self.root / "profiles"
+        self.profiles.mkdir()
+
+    def delete(self, path, state=None, config_dir="default"):
+        state = state if state is not None else {}
+        config_dir = str(self.profiles) if config_dir == "default" else config_dir
+        args = type("Args", (), {"config": str(path), "config_dir": config_dir})()
+        with (
+            patch.object(module, "load_state", return_value=state),
+            patch.object(module, "save_state") as save_state,
+            patch.object(module, "run") as run,
+            patch.object(module, "secret_clear") as secret_clear,
+            patch("sys.stdout", io.StringIO()) as output,
+            self.assertRaises(SystemExit),
+        ):
+            module.command_delete(args)
+        return json.loads(output.getvalue()), run, secret_clear, save_state
+
+    def files(self):
+        return sorted(str(p.relative_to(self.profiles)) for p in self.profiles.rglob("*"))
+
+    def test_flat_profile_is_removed_with_its_connection_and_secrets(self):
+        path = self.write("profiles/home.ovpn", CLIENT)
+        self.write("profiles/other.ovpn", CLIENT)
+        (self.profiles / "empty-unrelated").mkdir()
+        state = {str(path): {"uuid": "u1", "name": "Home"}, "/elsewhere.ovpn": {"uuid": "u2"}}
+        result, run, secret_clear, save_state = self.delete(path, state)
+        self.assertEqual(result, {"ok": True, "message": "Deleted Home"})
+        run.assert_called_once_with(["nmcli", "connection", "delete", "uuid", "u1"], check=False)
+        secret_clear.assert_called_once_with(path)
+        save_state.assert_called_once_with({"/elsewhere.ovpn": {"uuid": "u2"}})
+        self.assertEqual(self.files(), ["empty-unrelated", "other.ovpn"])
+
+    def test_bundle_folder_goes_away_but_unrelated_files_stay(self):
+        self.write("profiles/office/certs/client.crt", "CERT")
+        self.write("profiles/office/client.key", PLAIN_PEM)
+        office = self.write("profiles/office/client.ovpn", CLIENT + "cert certs/client.crt\nkey client.key\n")
+        self.write("profiles/lab/lab.key", PLAIN_PEM)
+        self.write("profiles/lab/README.txt", "notes")
+        lab = self.write("profiles/lab/lab.ovpn", CLIENT + "key lab.key\n")
+        self.delete(office)
+        self.delete(lab)
+        self.assertEqual(self.files(), ["lab", "lab/README.txt"])
+
+    def test_files_shared_with_another_profile_or_outside_the_folder_are_kept(self):
+        self.write("profiles/ca.crt", "CA")
+        self.write("profiles/site/shared.key", PLAIN_PEM)
+        first = self.write("profiles/site/a.ovpn", CLIENT + "key shared.key\nca ../ca.crt\n")
+        self.write("profiles/site/b.ovpn", CLIENT + "key shared.key\n")
+        self.delete(first)
+        self.assertEqual(self.files(), ["ca.crt", "site", "site/b.ovpn", "site/shared.key"])
+
+    def test_refuses_profiles_outside_the_profiles_directory(self):
+        outside = self.write("Downloads/vpn.ovpn", CLIENT)
+        deep = self.write("profiles/a/b/vpn.ovpn", CLIENT)
+        for path, config_dir in ((outside, "default"), (deep, "default"), (self.write("profiles/x.ovpn", CLIENT), None)):
+            args = type("Args", (), {"config": str(path), "config_dir": str(self.profiles) if config_dir else None})()
+            with self.subTest(path=path.name), patch.object(module, "run") as run, self.assertRaises(module.WidgetError):
+                module.command_delete(args)
+            run.assert_not_called()
+            self.assertTrue(path.exists())
 
 
 class AddProfileTests(TempDirTestCase):

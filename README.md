@@ -19,7 +19,7 @@ Inspired by and based on [debba/omarchy-openvpn-widget](https://github.com/debba
   | `auth-user-pass` + certificate | username + password (+ passphrase if the key is encrypted) |
 
   Certificates may be referenced by path (relative to the profile file) or inlined as `<ca>`, `<cert>`, `<key>`, `<pkcs12>`, and similar blocks. Missing certificate files are reported on the profile before NetworkManager is involved.
-- **Safe inline certificate imports.** NetworkManager writes inline certificates to `~/.local/share/networkmanagement/certificates/nm-openvpn/<file name>-<tag>.pem` and overwrites what is already there, so two profiles both named `client.ovpn` would end up sharing one key. This plugin imports such profiles under a unique name, and **Forget** removes the extracted key files.
+- **Safe inline certificate imports.** NetworkManager writes inline certificates to `~/.local/share/networkmanagement/certificates/nm-openvpn/<file name>-<tag>.pem` and overwrites what is already there, so two profiles both named `client.ovpn` would end up sharing one key. This plugin imports such profiles under a unique name, and **Delete** removes the extracted key files.
 - **Add profiles from the panel.** Pick an `.ovpn`/`.conf` file or a `.zip` bundle in the desktop file chooser and the plugin copies it into your profile directory, along with any certificate files the profile references.
 - Imports a profile into NetworkManager only when you first use it.
 - Custom display names, keyring-backed credentials, and themed Omarchy UI.
@@ -32,6 +32,7 @@ Secrets are never stored in `shell.json`, the plugin state file, NetworkManager 
 - On connect, secrets go to NetworkManager through a temporary `0600` `passwd-file`, which is deleted immediately afterwards. Values are escaped for nmcli, so passwords with spaces or backslashes work.
 - Each secret's flag is set to "not saved", so NetworkManager never writes it to `/etc/NetworkManager/system-connections`. The username is set only for the duration of the activation.
 - Refreshing only reads keyring item *attributes*, so a locked keyring does not prompt until you actually connect.
+- The profile directory is created automatically (`0700`). On every refresh, the directory, each profile, the certificate and key files it references inside the directory, and the folders holding them lose group and other access. Owner permissions are kept, so helper scripts stay executable. Files you don't own, symlinks, and anything outside the directory are left alone.
 
 The local state file is `~/.local/state/omarchy-openvpn-plugin/profiles.json`. It holds profile paths, NetworkManager UUIDs, custom display names, and the paths of certificate files NetworkManager extracted.
 
@@ -85,7 +86,7 @@ The shell notices changed plugin files and rebuilds the widget, but it rebuilds 
    - A profile that references certificate files next to it (`cert client.crt`) gets its own folder with those files. References outside the profile's folder (`../ca.crt`) are refused; copy such folders by hand.
    - A `.zip` bundle is extracted into its own folder, with a single wrapping folder removed. Profiles must sit at the top of the bundle. Unsafe paths and oversized archives are refused.
 
-   Copied files are `0600` and folders `0700`. The profile directory is created if it is missing.
+   Copied files are `0600` and folders `0700`.
 
    Alternatively, copy your provider's files into `~/.config/openvpn` yourself, either flat or one folder per profile:
 
@@ -102,7 +103,7 @@ The shell notices changed plugin files and rebuilds the widget, but it rebuilds 
        └── lab.p12
    ```
 
-   You can choose a different directory in the Omarchy bar settings. If the directory does not exist yet, the panel also offers a **Create directory** button, which creates it with `0700` permissions.
+   You can choose a different directory in the Omarchy bar settings; it is created if it does not exist.
 2. Each profile in the panel shows its auth type and whether it is ready.
 3. Click a profile, or its connect icon. If secrets are missing, the panel asks for exactly the fields that profile needs and saves them to the keyring before connecting.
 
@@ -116,10 +117,10 @@ Middle-click the bar icon, or press `r` in the panel, to refresh.
 | Connect | profile is disconnected and has no problems |
 | Rename | profile is disconnected |
 | Edit credentials / key passphrase | profile needs secrets |
-| Forget (click twice) | profile was imported, or has saved secrets or a custom name |
+| Delete (click twice) | profile is disconnected |
 | Disconnect | profile is connected or connecting |
 
-**Forget** deletes the imported NetworkManager profile, its keyring secrets, and the certificate files NetworkManager extracted for it. It never touches your original `.ovpn`/`.conf` files or the certificates they reference.
+**Delete** removes the NetworkManager connection, the profile's keyring secrets, its custom name, the certificate files NetworkManager extracted for it, and the profile file itself. It also removes the certificate and key files the profile references from its own folder, unless another profile in that folder still uses them, and then the folder if that leaves it empty. Unrelated files in the folder and anything outside the profile directory are never touched.
 
 ### IPC
 
@@ -164,7 +165,7 @@ omarchy plugin remove rmarchei.openvpn   # plugin manager install
 ./uninstall.sh                           # install.sh install
 ```
 
-Both keep imported NetworkManager profiles, keyring entries, local state, and system packages. To remove imported profiles and secrets, use **Forget** on each profile before uninstalling.
+Both keep imported NetworkManager profiles, keyring entries, local state, and system packages. To remove them, use **Delete** on each profile before uninstalling.
 
 ## License
 

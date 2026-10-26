@@ -25,7 +25,6 @@ Panel {
   readonly property bool connecting: actionKind === "connect" || activeProfiles.some(function(profile) { return profile.state === "activating" })
 
   property var profiles: []
-  property bool directoryExists: true
   property string editPath: ""
   property string editName: ""
   property var editFields: []
@@ -34,7 +33,7 @@ Panel {
   property string usernameText: ""
   property string passwordText: ""
   property string passphraseText: ""
-  property string forgetPath: ""
+  property string deletePath: ""
   property string message: ""
   // Action errors last until the panel closes or the next action starts;
   // list errors until the backend answers a refresh again.
@@ -113,7 +112,7 @@ Panel {
 
   function openCredentials(profile, thenConnect) {
     closeRename()
-    forgetPath = ""
+    deletePath = ""
     editPath = profile.path
     editName = profile.name
     editFields = profile.requiredSecrets
@@ -137,7 +136,7 @@ Panel {
 
   function openRename(profile) {
     closeCredentials()
-    forgetPath = ""
+    deletePath = ""
     renamePath = profile.path
     renameText = profile.name
     Qt.callLater(function() {
@@ -163,7 +162,6 @@ Panel {
 
   function actionCommand(kind, path) {
     if (kind === "disconnect-all") return [helperPath, kind]
-    if (kind === "create-directory") return [helperPath, kind, "--config-dir", configDirectory]
     if (kind === "add-profile") return [helperPath, kind, "--source", path, "--config-dir", configDirectory]
     var command = [helperPath, kind, "--config", path, "--config-dir", configDirectory]
     if (kind === "connect" && singleConnection) command.push("--exclusive")
@@ -194,20 +192,21 @@ Panel {
 
   function activate(profile) {
     if (!profile || actionProcess.running) return
-    forgetPath = ""
+    deletePath = ""
     if (profile.active || profile.state === "activating") runAction("disconnect", profile.path)
     else if (profile.problems.length > 0) errorMessage = profile.problems[0]
     else if (profile.hasSecrets) runAction("connect", profile.path)
     else openCredentials(profile, true)
   }
 
-  function forget(profile) {
-    if (forgetPath !== profile.path) {
-      forgetPath = profile.path
+  // Two clicks: the first arms the button, the second deletes.
+  function deleteProfile(profile) {
+    if (deletePath !== profile.path) {
+      deletePath = profile.path
       return
     }
-    forgetPath = ""
-    runAction("forget", profile.path)
+    deletePath = ""
+    runAction("delete", profile.path)
   }
 
   function saveCredentials() {
@@ -227,7 +226,7 @@ Panel {
   }
 
   onOpenedChanged: {
-    forgetPath = ""
+    deletePath = ""
     if (opened) {
       refresh()
     } else {
@@ -265,8 +264,6 @@ Panel {
       var result = root.parseResult(listOutput.text)
       if (exitCode === 0 && result.ok) {
         root.profiles = result.profiles || []
-        // A missing directory is the normal first-run state, not an error.
-        root.directoryExists = result.directoryExists !== false
         root.listErrorMessage = ""
       } else {
         root.listErrorMessage = result.error || String(listError.text || "Could not load OpenVPN profiles").trim()
@@ -461,9 +458,7 @@ Panel {
           Text {
             visible: root.profiles.length === 0 && root.shownError === ""
             width: parent.width
-            text: root.directoryExists
-              ? "No profiles in " + root.configDirectory + " yet. Add an .ovpn, .conf or .zip bundle, or copy files there."
-              : root.configDirectory + " does not exist yet. Add a profile to create it, or choose another directory in the widget settings."
+            text: "No profiles in " + root.configDirectory + " yet. Add an .ovpn, .conf or .zip bundle, or copy files there."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -471,27 +466,15 @@ Panel {
             horizontalAlignment: Text.AlignHCenter
           }
 
-          Row {
+          Button {
             visible: root.profiles.length === 0 && root.shownError === ""
             anchors.horizontalCenter: parent.horizontalCenter
-            spacing: Style.space(8)
-
-            Button {
-              text: pickProcess.running ? "Choosing…" : "Add profile…"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              bordered: true
-              enabled: !pickProcess.running && !actionProcess.running
-              onClicked: root.addProfile()
-            }
-            Button {
-              visible: !root.directoryExists
-              text: "Create directory"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              enabled: !actionProcess.running
-              onClicked: root.runAction("create-directory", "")
-            }
+            text: pickProcess.running ? "Choosing…" : "Add profile…"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            bordered: true
+            enabled: !pickProcess.running && !actionProcess.running
+            onClicked: root.addProfile()
           }
 
           Column {
@@ -506,7 +489,7 @@ Panel {
                 required property var modelData
                 readonly property bool busy: root.actionPath === modelData.path
                 readonly property bool live: modelData.active || modelData.state === "activating"
-                readonly property bool confirmingForget: root.forgetPath === modelData.path
+                readonly property bool confirmingDelete: root.deletePath === modelData.path
                 width: parent.width
                 implicitHeight: profileRow.implicitHeight + Style.space(12)
                 current: modelData.active
@@ -590,14 +573,14 @@ Panel {
                   }
 
                   PanelActionButton {
-                    visible: !profileItem.live && (profileItem.modelData.imported || profileItem.modelData.storedSecrets.length > 0 || profileItem.modelData.customName)
+                    visible: !profileItem.live
                     enabled: !actionProcess.running
                     iconText: "󰆴"
-                    tooltipText: profileItem.confirmingForget ? "Click again to forget" : "Forget profile and credentials"
-                    foreground: profileItem.confirmingForget ? root.urgent : root.foreground
+                    tooltipText: profileItem.confirmingDelete ? "Click again to delete " + profileItem.modelData.relativePath : "Delete profile"
+                    foreground: profileItem.confirmingDelete ? root.urgent : root.foreground
                     fontFamily: root.fontFamily
                     Layout.alignment: Qt.AlignVCenter
-                    onClicked: root.forget(profileItem.modelData)
+                    onClicked: root.deleteProfile(profileItem.modelData)
                   }
 
                   PanelActionButton {

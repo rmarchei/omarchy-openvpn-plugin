@@ -462,18 +462,21 @@ def remove_blobs(record: dict[str, Any], path: Path) -> None:
 
 def command_list(args: argparse.Namespace) -> None:
     directory = expand_directory(args.config_dir)
+    ensure_directory(directory)
+    paths = discover(directory)
+    secure_profiles(directory, paths)
     state = load_state()
     connections = nm_connections()
     secrets = stored_secret_index()
     changed = False
     profiles = []
 
-    for path in discover(directory):
+    for path in paths:
         record = state.get(str(path), {})
         uuid = record.get("uuid", "")
         if uuid and uuid not in connections:
             # The NetworkManager profile was deleted elsewhere. Keep the custom
-            # name, and the blob list so Forget can still clean those files up.
+            # name, and the blob list so Delete can still clean those files up.
             record = {key: value for key, value in record.items() if key in {"name", "blobs"} and value}
             if record:
                 state[str(path)] = record
@@ -509,7 +512,7 @@ def command_list(args: argparse.Namespace) -> None:
 
     if changed:
         save_state(state)
-    emit({"ok": True, "directory": str(directory), "directoryExists": directory.is_dir(), "profiles": profiles})
+    emit({"ok": True, "directory": str(directory), "profiles": profiles})
 
 
 def read_payload() -> dict[str, Any]:
@@ -652,10 +655,34 @@ def ensure_directory(directory: Path) -> None:
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
-def command_create_directory(args: argparse.Namespace) -> None:
-    directory = expand_directory(args.config_dir)
-    ensure_directory(directory)
-    emit({"ok": True, "message": f"Created {directory}. Add your .ovpn or .conf files there."})
+def make_private(path: Path) -> None:
+    """Drop group and other access from a file or folder the user owns."""
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+            return
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & 0o077:
+            os.chmod(path, mode & ~0o077)
+    except OSError:
+        pass
+
+
+def secure_profiles(directory: Path, profiles: list[Path]) -> None:
+    """Keep profiles, the keys they reference, and their folders owner-only.
+
+    Owner bits are kept, so helper scripts stay executable. Only paths inside
+    the profiles directory are touched.
+    """
+    targets = {directory}
+    for path in profiles:
+        for item in (path, *owned_references(path)):
+            targets.add(item)
+            targets.update(item.parents)
+    # Discovered profiles are resolved, so a symlinked one may point elsewhere.
+    for target in targets:
+        if target.is_relative_to(directory):
+            make_private(target)
 
 
 # ---------------------------------------------------------------------------
@@ -898,16 +925,51 @@ def command_pick_file(_args: argparse.Namespace) -> None:
     emit({"ok": True, "path": pick_file()})
 
 
-def command_forget(args: argparse.Namespace) -> None:
+def owned_references(path: Path) -> set[Path]:
+    """Files a profile references inside its own folder."""
+    folder = path.parent
+    owned = set()
+    for reference in profile_references(path):
+        target = (folder / reference).resolve()
+        if target.is_relative_to(folder) and target.is_file():
+            owned.add(target)
+    return owned
+
+
+def delete_profile_files(path: Path, directory: Path) -> None:
+    """Delete a profile and the files only it uses; never anything outside its folder."""
+    folder = path.parent
+    others = [item for item in folder.iterdir() if item != path and not item.name.startswith(".") and item.is_file() and item.suffix.lower() in SUPPORTED_SUFFIXES]
+    still_used = set().union(*(owned_references(other) for other in others))
+    deleted = sorted(owned_references(path) - still_used - {path}) + [path]
+    for target in deleted:
+        target.unlink(missing_ok=True)
+
+    # Remove only the folders this emptied, up to but never including the profiles directory.
+    for parent in sorted({target.parent for target in deleted}, key=lambda item: len(item.parts), reverse=True):
+        while parent != directory and parent.is_relative_to(directory) and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
+
+
+def command_delete(args: argparse.Namespace) -> None:
     path = require_config(args.config)
+    if not args.config_dir:
+        raise WidgetError("The profiles directory is required to delete a profile")
+    directory = expand_directory(args.config_dir)
+    if path.parent != directory and path.parent.parent != directory:
+        raise WidgetError("Only profiles inside the profiles directory can be deleted")
+
     state = load_state()
     record = state.pop(str(path), {})
+    name = display_name(path, record, args.config_dir)
     if record.get("uuid"):
         run(["nmcli", "connection", "delete", "uuid", record["uuid"]], check=False)
     remove_blobs(record, path)
     secret_clear(path)
     save_state(state)
-    emit({"ok": True, "message": f"Removed {path.stem} credentials and imported profile"})
+    delete_profile_files(path, directory)
+    emit({"ok": True, "message": f"Deleted {name}"})
 
 
 def parser() -> argparse.ArgumentParser:
@@ -919,10 +981,6 @@ def parser() -> argparse.ArgumentParser:
     list_parser.set_defaults(handler=command_list)
 
     subparsers.add_parser("disconnect-all").set_defaults(handler=command_disconnect_all)
-
-    create_parser = subparsers.add_parser("create-directory")
-    create_parser.add_argument("--config-dir", default="~/.config/openvpn")
-    create_parser.set_defaults(handler=command_create_directory)
 
     subparsers.add_parser("pick-file").set_defaults(handler=command_pick_file)
 
@@ -936,11 +994,11 @@ def parser() -> argparse.ArgumentParser:
         ("rename", command_rename),
         ("connect", command_connect),
         ("disconnect", command_disconnect),
-        ("forget", command_forget),
+        ("delete", command_delete),
     ):
         action_parser = subparsers.add_parser(name)
         action_parser.add_argument("--config", required=True)
-        action_parser.add_argument("--config-dir", help="profile directory, used to derive default names")
+        action_parser.add_argument("--config-dir", help="profiles directory, used for default names and to scope delete")
         if name == "connect":
             action_parser.add_argument(
                 "--exclusive",

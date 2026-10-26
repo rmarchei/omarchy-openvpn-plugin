@@ -61,10 +61,17 @@ omarchy plugin add https://github.com/rmarchei/omarchy-openvpn-plugin.git --enab
 ```bash
 git clone https://github.com/rmarchei/omarchy-openvpn-plugin.git
 cd omarchy-openvpn-plugin
-./install.sh            # add --replace to back up and replace an existing install
+./install.sh
 ```
 
-The installer validates the plugin, installs the packages above, copies the plugin to `~/.config/omarchy/plugins/rmarchei.openvpn`, and enables it in the right section of the bar.
+The installer validates the plugin, installs the packages above, copies the plugin to `~/.config/omarchy/plugins/rmarchei.openvpn`, and enables it in the right section of the bar. It refuses to touch an existing installation unless you pass a mode:
+
+| Command | Packages | Existing install | Bar position |
+| --- | --- | --- | --- |
+| `./install.sh --update` | not touched (warns if missing) | files refreshed in place | kept |
+| `./install.sh --replace` | installed if missing | moved to a hidden `.rmarchei.openvpn.backup.*` folder, then reinstalled | reset to the right section, after the tray |
+
+After `git pull`, run `./install.sh --update`. A copy installed with `omarchy plugin add` is a git checkout; update that one with `omarchy plugin update rmarchei.openvpn` instead.
 
 ## Usage
 
@@ -130,10 +137,10 @@ The backend can be run on its own:
 scripts/openvpn-plugin list --config-dir ~/.config/openvpn
 ```
 
-For live development, copy the plugin into the user plugin directory (the validator rejects symlinks inside a plugin, and the shell reloads on save):
+For live development, install once, then push each change into the user plugin directory. The shell reloads on save.
 
 ```bash
-./install.sh --replace
+./install.sh --update
 ```
 
 ## Uninstallation

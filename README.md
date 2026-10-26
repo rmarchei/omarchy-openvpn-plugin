@@ -2,6 +2,8 @@
 
 An [Omarchy](https://omarchy.org/) bar widget that manages multiple OpenVPN profiles through NetworkManager. It supports username/password, client certificates (PEM or PKCS#12, including encrypted keys), and both together. All secrets stay in the system keyring.
 
+![The OpenVPN Profiles panel with a connected profile and its live details](preview.png)
+
 Inspired by and based on [debba/omarchy-openvpn-widget](https://github.com/debba/omarchy-openvpn-widget).
 
 ## Highlights

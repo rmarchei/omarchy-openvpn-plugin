@@ -20,6 +20,7 @@ Inspired by and based on [debba/omarchy-openvpn-widget](https://github.com/debba
 
   Certificates may be referenced by path (relative to the profile file) or inlined as `<ca>`, `<cert>`, `<key>`, `<pkcs12>`, and similar blocks. Missing certificate files are reported on the profile before NetworkManager is involved.
 - **Safe inline certificate imports.** NetworkManager writes inline certificates to `~/.local/share/networkmanagement/certificates/nm-openvpn/<file name>-<tag>.pem` and overwrites what is already there, so two profiles both named `client.ovpn` would end up sharing one key. This plugin imports such profiles under a unique name, and **Forget** removes the extracted key files.
+- **Add profiles from the panel.** Pick an `.ovpn`/`.conf` file or a `.zip` bundle in the desktop file chooser and the plugin copies it into your profile directory, along with any certificate files the profile references.
 - Imports a profile into NetworkManager only when you first use it.
 - Custom display names, keyring-backed credentials, and themed Omarchy UI.
 
@@ -37,15 +38,16 @@ The local state file is `~/.local/state/omarchy-openvpn-plugin/profiles.json`. I
 ## What you need
 
 - Omarchy 4.x (Quickshell plugin API)
-- Python 3.10+ (standard library only)
+- The system Python, `/usr/bin/python3` 3.10+. The backend uses it explicitly, so mise, pyenv or Homebrew Pythons earlier on your `PATH` don't matter.
 - NetworkManager, running (`systemctl is-active NetworkManager`)
 - `openvpn` and `networkmanager-openvpn`
 - `libsecret` (for `secret-tool`) and a running Secret Service provider such as GNOME Keyring. Only needed for profiles that use a password or an encrypted key.
+- `python-gobject` and `xdg-desktop-portal-gtk`, for the **Add profile** file chooser. Both ship with Omarchy.
 
 On Omarchy:
 
 ```bash
-omarchy pkg add openvpn networkmanager networkmanager-openvpn libsecret gnome-keyring
+omarchy pkg add openvpn networkmanager networkmanager-openvpn libsecret gnome-keyring python-gobject xdg-desktop-portal-gtk
 ```
 
 ## Installation
@@ -77,7 +79,15 @@ The shell notices changed plugin files and rebuilds the widget, but it rebuilds 
 
 ## Usage
 
-1. Put your provider's files in `~/.config/openvpn`, either flat or one folder per profile:
+1. Click the shield icon in the bar, then **Add profile…** (or **+** next to PROFILES, or press `a`). Choose an `.ovpn`/`.conf` file or a `.zip` bundle:
+
+   - A self-contained profile (inline certificates, or none) is copied as is.
+   - A profile that references certificate files next to it (`cert client.crt`) gets its own folder with those files. References outside the profile's folder (`../ca.crt`) are refused; copy such folders by hand.
+   - A `.zip` bundle is extracted into its own folder, with a single wrapping folder removed. Profiles must sit at the top of the bundle. Unsafe paths and oversized archives are refused.
+
+   Copied files are `0600` and folders `0700`. The profile directory is created if it is missing.
+
+   Alternatively, copy your provider's files into `~/.config/openvpn` yourself, either flat or one folder per profile:
 
    ```text
    ~/.config/openvpn/
@@ -92,8 +102,8 @@ The shell notices changed plugin files and rebuilds the widget, but it rebuilds 
        └── lab.p12
    ```
 
-   You can choose a different directory in the Omarchy bar settings. If the directory does not exist yet, the panel offers a **Create directory** button, which creates it with `0700` permissions.
-2. Click the shield icon in the bar. Each profile shows its auth type and whether it is ready.
+   You can choose a different directory in the Omarchy bar settings. If the directory does not exist yet, the panel also offers a **Create directory** button, which creates it with `0700` permissions.
+2. Each profile in the panel shows its auth type and whether it is ready.
 3. Click a profile, or its connect icon. If secrets are missing, the panel asks for exactly the fields that profile needs and saves them to the keyring before connecting.
 
 Middle-click the bar icon, or press `r` in the panel, to refresh.
@@ -102,6 +112,7 @@ Middle-click the bar icon, or press `r` in the panel, to refresh.
 
 | Action | When |
 | --- | --- |
+| Add profile (`+`, `a`) | always |
 | Connect | profile is disconnected and has no problems |
 | Rename | profile is disconnected |
 | Edit credentials / key passphrase | profile needs secrets |

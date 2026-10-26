@@ -1,7 +1,7 @@
 """Unit tests for backend functions; NetworkManager and Secret Service are mocked."""
 
 from importlib.machinery import SourceFileLoader
-from importlib.util import module_from_spec, spec_from_loader
+from importlib.util import find_spec, module_from_spec, spec_from_loader
 import io
 import json
 from pathlib import Path
@@ -306,6 +306,100 @@ class ConnectTests(TempDirTestCase):
             ):
                 module.command_connect(args)
             run.assert_not_called()
+
+
+class AddProfileTests(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.profiles = self.root / "profiles"
+
+    def add(self, source):
+        args = type("Args", (), {"source": str(source), "config_dir": str(self.profiles)})()
+        with patch("sys.stdout", io.StringIO()) as output, self.assertRaises(SystemExit):
+            module.command_add_profile(args)
+        return json.loads(output.getvalue())
+
+    def mode(self, path):
+        return path.stat().st_mode & 0o777
+
+    def test_self_contained_profile_is_copied_privately_and_creates_the_directory(self):
+        source = self.write("Downloads/home.ovpn", CLIENT + "auth-user-pass\n<ca>\nX\n</ca>\n")
+        result = self.add(source)
+        target = self.profiles / "home.ovpn"
+        self.assertEqual(result["message"], "Added home")
+        self.assertEqual(target.read_text(), source.read_text())
+        self.assertEqual((self.mode(self.profiles), self.mode(target)), (0o700, 0o600))
+
+    def test_profile_with_certificate_files_gets_its_own_folder(self):
+        self.write("Downloads/office/certs/client.crt", "CERT")
+        self.write("Downloads/office/client.key", PLAIN_PEM)
+        source = self.write("Downloads/office/client.ovpn", CLIENT + "cert certs/client.crt\nkey client.key\n")
+        self.write("Downloads/office/unrelated.txt", "not copied")
+        result = self.add(source)
+        folder = self.profiles / "office"
+        self.assertEqual(result["added"], [str(folder / "client.ovpn")])
+        self.assertEqual(sorted(str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file()), ["certs/client.crt", "client.key", "client.ovpn"])
+        self.assertEqual(module.inspect_config(folder / "client.ovpn").problems, [])
+        self.assertEqual(self.mode(folder / "client.key"), 0o600)
+        self.assertEqual(list(self.profiles.glob(".import-*")), [])
+
+    def test_duplicates_are_refused_and_name_clashes_get_a_suffix(self):
+        source = self.write("Downloads/vpn.ovpn", CLIENT)
+        self.add(source)
+        with self.assertRaisesRegex(module.WidgetError, "already in your profiles"):
+            self.add(source)
+        other = self.write("Elsewhere/vpn.ovpn", CLIENT + "remote second.example 1194\n")
+        self.assertEqual(self.add(other)["added"], [str(self.profiles / "vpn-2.ovpn")])
+
+    def test_unsafe_or_incomplete_profiles_are_refused(self):
+        self.write("Downloads/shared-ca.crt", "CA")
+        cases = (
+            (self.write("Downloads/sub/up.ovpn", CLIENT + "ca ../shared-ca.crt\n"), "outside its folder"),
+            (self.write("Downloads/missing.ovpn", CLIENT + "cert nope.crt\n"), "not found next to it"),
+            (self.write("Downloads/server.conf", "port 1194\ndev tun\n"), "Not an OpenVPN client configuration"),
+            (self.write("Downloads/notes.txt", "hello"), "Choose an .ovpn"),
+        )
+        for source, error in cases:
+            with self.subTest(source=source.name), self.assertRaisesRegex(module.WidgetError, error):
+                self.add(source)
+        self.assertEqual(list(self.profiles.iterdir()), [])
+
+    def test_zip_bundle_is_unwrapped_into_its_own_folder(self):
+        bundle = self.root / "pfsense-alice.zip"
+        with module.zipfile.ZipFile(bundle, "w") as archive:
+            archive.writestr("pfsense-alice/alice.ovpn", CLIENT + "pkcs12 alice.p12\n")
+            archive.writestr("pfsense-alice/alice.p12", "P12")
+            archive.writestr("__MACOSX/pfsense-alice/._alice.ovpn", "junk")
+        result = self.add(bundle)
+        folder = self.profiles / "pfsense-alice"
+        self.assertEqual(result["added"], [str(folder / "alice.ovpn")])
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["alice.ovpn", "alice.p12"])
+        self.assertEqual(module.inspect_config(folder / "alice.ovpn").required_secrets, ["cert-pass"])
+
+    def test_zip_with_unsafe_paths_or_no_profiles_is_refused(self):
+        cases = {"evil.zip": ("../../escape.ovpn", CLIENT), "empty.zip": ("deep/er/x.ovpn", CLIENT)}
+        for name, (member, text) in cases.items():
+            bundle = self.root / name
+            with module.zipfile.ZipFile(bundle, "w") as archive:
+                archive.writestr(member, text)
+                archive.writestr("readme.txt", "x")
+            with self.subTest(name=name), self.assertRaisesRegex(module.WidgetError, "unsafe path|no .ovpn"):
+                self.add(bundle)
+        self.assertFalse((self.root / "escape.ovpn").exists())
+        self.assertEqual([p.name for p in self.profiles.iterdir()], [])
+
+    def test_portal_uris_become_paths(self):
+        self.assertEqual(module.uri_to_path("file:///home/u/My%20VPN.ovpn"), "/home/u/My VPN.ovpn")
+        with self.assertRaises(module.WidgetError):
+            module.uri_to_path("sftp://host/vpn.ovpn")
+
+    @unittest.skipUnless(find_spec("gi"), "python-gobject not installed")
+    def test_file_chooser_options_match_the_portal_signature(self):
+        options = module.file_chooser_options("token_1", self.root)
+        self.assertEqual(options.get_type_string(), "(ssa{sv})")
+        parent, title, values = options.unpack()
+        self.assertEqual((parent, title, values["handle_token"]), ("", "Add OpenVPN profile", "token_1"))
+        self.assertEqual(bytes(values["current_folder"]), bytes(self.root) + b"\0")
 
 
 if __name__ == "__main__":

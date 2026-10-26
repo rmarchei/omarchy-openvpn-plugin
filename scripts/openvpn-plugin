@@ -1,5 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """NetworkManager/OpenVPN backend for the Omarchy OpenVPN plugin."""
+
+# The system interpreter is used on purpose: the shell's PATH may put a
+# version manager's Python first, and the file chooser needs the system's
+# python-gobject.
 
 from __future__ import annotations
 
@@ -8,13 +12,17 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any
+from typing import Any, BinaryIO
+from urllib.parse import unquote, urlparse
+import zipfile
 
 APP_ID = "omarchy-openvpn-plugin"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / APP_ID
@@ -41,6 +49,10 @@ FILE_DIRECTIVES = {
     "crl-verify",
 }
 ENCRYPTED_KEY_MARKERS = ("Proc-Type: 4,ENCRYPTED", "-----BEGIN ENCRYPTED PRIVATE KEY-----")
+# Limits for imported profiles and bundles; real ones are a few kilobytes.
+MAX_PROFILE_BYTES = 1024 * 1024
+MAX_IMPORT_BYTES = 10 * 1024 * 1024
+MAX_ARCHIVE_FILES = 200
 
 
 class WidgetError(RuntimeError):
@@ -354,9 +366,12 @@ def require_config(raw: str) -> Path:
     return path
 
 
+GENERIC_PROFILE_NAMES = {"client", "config", "openvpn", "profile"}
+
+
 def default_name(path: Path, directory: Path | None = None) -> str:
     # Per-profile folders often contain a generic "client.ovpn"; prefer the folder name.
-    if directory and path.parent != directory and path.stem.casefold() in {"client", "config", "openvpn", "profile"}:
+    if directory and path.parent != directory and path.stem.casefold() in GENERIC_PROFILE_NAMES:
         return path.parent.name
     return path.stem
 
@@ -630,13 +645,257 @@ def command_disconnect_all(_args: argparse.Namespace) -> None:
     emit({"ok": True, "message": f"Disconnected {', '.join(stopped)}" if stopped else "No profile was connected"})
 
 
-def command_create_directory(args: argparse.Namespace) -> None:
-    directory = expand_directory(args.config_dir)
+def ensure_directory(directory: Path) -> None:
     if directory.exists() and not directory.is_dir():
         raise WidgetError(f"{directory} exists and is not a directory")
     # Private: profiles in here usually reference client keys.
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
+def command_create_directory(args: argparse.Namespace) -> None:
+    directory = expand_directory(args.config_dir)
+    ensure_directory(directory)
     emit({"ok": True, "message": f"Created {directory}. Add your .ovpn or .conf files there."})
+
+
+# ---------------------------------------------------------------------------
+# Adding profiles
+
+
+def unique_path(path: Path, *, folder: bool = False) -> Path:
+    if not path.exists():
+        return path
+    index = 2
+    while True:
+        candidate = path.with_name(f"{path.name}-{index}" if folder else f"{path.stem}-{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def copy_private(source: BinaryIO, target: Path) -> None:
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        shutil.copyfileobj(source, stream)
+
+
+def profile_references(path: Path) -> list[str]:
+    """Return the relative file references of a profile that must travel with it."""
+    references = []
+    text = read_text(path) or ""
+    for raw_line in text.splitlines():
+        tokens = tokenize(raw_line.strip()) if raw_line.strip()[:1] not in {"#", ";", "<"} else []
+        if len(tokens) > 1 and tokens[0].removeprefix("--") in FILE_DIRECTIVES and tokens[1] != "[inline]":
+            if not expand_path(tokens[1]).is_absolute():
+                references.append(tokens[1])
+    return references
+
+
+def staging_directory(directory: Path) -> Path:
+    # Hidden, so a refresh never lists a half-copied profile.
+    return Path(tempfile.mkdtemp(prefix=".import-", dir=directory))
+
+
+def add_profile_file(source: Path, directory: Path) -> list[Path]:
+    if source.stat().st_size > MAX_PROFILE_BYTES:
+        raise WidgetError(f"{source.name} is too large to be an OpenVPN profile")
+    info = inspect_config(source)
+    for problem in ("Cannot read the configuration file", "Not an OpenVPN client configuration", "No remote server defined"):
+        if problem in info.problems:
+            raise WidgetError(f"{source.name}: {problem}")
+
+    references = profile_references(source)
+    if not references:
+        target = directory / source.name
+        if target.exists() and target.read_bytes() == source.read_bytes():
+            raise WidgetError(f"{source.name} is already in your profiles")
+        target = unique_path(target)
+        with source.open("rb") as stream:
+            copy_private(stream, target)
+        return [target]
+
+    # Referenced certificates keep their layout next to the profile, in a folder of its own.
+    files = {source.name: source}
+    total = source.stat().st_size
+    for reference in references:
+        relative = PurePosixPath(reference)
+        referenced = (source.parent / reference).resolve()
+        if ".." in relative.parts or not referenced.is_relative_to(source.parent.resolve()):
+            raise WidgetError(f"{source.name} references {reference} outside its folder; copy the folder into your profiles directory instead")
+        if not referenced.is_file():
+            raise WidgetError(f"{source.name} references {reference}, which was not found next to it")
+        files[str(relative)] = referenced
+        total += referenced.stat().st_size
+    if total > MAX_IMPORT_BYTES:
+        raise WidgetError(f"{source.name} and its files are too large to import")
+
+    staging = staging_directory(directory)
+    try:
+        for name, path in files.items():
+            with path.open("rb") as stream:
+                copy_private(stream, staging / name)
+        # A generic client.ovpn takes its bundle folder's name, unless that is just Downloads.
+        folder_name = source.stem
+        if source.stem.casefold() in GENERIC_PROFILE_NAMES and source.parent.name.casefold() not in {"", "downloads", "download", "tmp"}:
+            folder_name = source.parent.name
+        target = unique_path(directory / folder_name, folder=True)
+        staging.rename(target)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return [target / source.name]
+
+
+def archive_members(archive: zipfile.ZipFile) -> list[tuple[zipfile.ZipInfo, PurePosixPath]]:
+    members = []
+    total = 0
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        name = PurePosixPath(info.filename.replace("\\", "/"))
+        if name.is_absolute() or ".." in name.parts or stat.S_ISLNK(info.external_attr >> 16):
+            raise WidgetError(f"The archive contains an unsafe path: {info.filename}")
+        if any(part.startswith(".") or part == "__MACOSX" for part in name.parts):
+            continue
+        total += info.file_size
+        members.append((info, name))
+    if len(members) > MAX_ARCHIVE_FILES or total > MAX_IMPORT_BYTES:
+        raise WidgetError("The archive is too large to be an OpenVPN bundle")
+    # Bundles often wrap everything in one folder; unwrap it so profiles sit at the top.
+    tops = {name.parts[0] for _, name in members}
+    if len(tops) == 1 and all(len(name.parts) > 1 for _, name in members):
+        members = [(info, PurePosixPath(*name.parts[1:])) for info, name in members]
+    return members
+
+
+def add_profile_archive(source: Path, directory: Path) -> list[Path]:
+    try:
+        with zipfile.ZipFile(source) as archive:
+            members = archive_members(archive)
+            profiles = [name for _, name in members if len(name.parts) == 1 and name.suffix.lower() in SUPPORTED_SUFFIXES]
+            if not profiles:
+                raise WidgetError(f"{source.name} has no .ovpn or .conf profile at its top level")
+            staging = staging_directory(directory)
+            try:
+                for info, name in members:
+                    with archive.open(info) as stream:
+                        copy_private(stream, staging.joinpath(*name.parts))
+                target = unique_path(directory / source.stem, folder=True)
+                staging.rename(target)
+            except BaseException:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+    except zipfile.BadZipFile as error:
+        raise WidgetError(f"{source.name} is not a valid zip archive") from error
+    return sorted(target / name.name for name in profiles)
+
+
+def command_add_profile(args: argparse.Namespace) -> None:
+    directory = expand_directory(args.config_dir)
+    source = expand_path(args.source).resolve()
+    if not source.is_file():
+        raise WidgetError(f"{args.source} does not exist")
+    if source.is_relative_to(directory):
+        raise WidgetError(f"{source.name} is already in your profiles directory")
+
+    ensure_directory(directory)
+    suffix = source.suffix.lower()
+    if suffix == ".zip":
+        added = add_profile_archive(source, directory)
+    elif suffix in SUPPORTED_SUFFIXES:
+        added = add_profile_file(source, directory)
+    else:
+        raise WidgetError("Choose an .ovpn, .conf, or .zip file")
+
+    names = [default_name(path, directory) for path in added]
+    message = f"Added {names[0]}" if len(names) == 1 else f"Added {len(names)} profiles from {source.name}"
+    emit({"ok": True, "message": message, "added": [str(path) for path in added]})
+
+
+def uri_to_path(uri: str) -> str:
+    parsed = urlparse(uri)
+    if parsed.scheme != "file":
+        raise WidgetError("Only local files can be added")
+    return unquote(parsed.path)
+
+
+def file_chooser_options(token: str, folder: Path | None) -> Any:
+    from gi.repository import GLib
+
+    options = {
+        "handle_token": GLib.Variant("s", token),
+        "modal": GLib.Variant("b", True),
+        "accept_label": GLib.Variant("s", "Add"),
+        "filters": GLib.Variant(
+            "a(sa(us))",
+            [
+                ("OpenVPN profiles and bundles", [(0, "*.ovpn"), (0, "*.conf"), (0, "*.zip")]),
+                ("All files", [(0, "*")]),
+            ],
+        ),
+    }
+    if folder and folder.is_dir():
+        options["current_folder"] = GLib.Variant("ay", os.fsencode(folder) + b"\0")
+    return GLib.Variant("(ssa{sv})", ("", "Add OpenVPN profile", options))
+
+
+def pick_file() -> str:
+    """Ask the desktop portal for a file; return its path, or "" when cancelled."""
+    try:
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio, GLib
+    except (ImportError, ValueError) as error:
+        raise WidgetError("The file chooser needs python-gobject (omarchy pkg add python-gobject)") from error
+
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        result: dict[str, Any] = {}
+        loop = GLib.MainLoop()
+
+        def on_response(_bus, _sender, path, _interface, _signal, parameters):
+            if path == result.get("handle"):
+                result["code"], result["values"] = parameters.unpack()
+                loop.quit()
+
+        # Subscribe before calling so the response cannot be missed.
+        subscription = bus.signal_subscribe(
+            "org.freedesktop.portal.Desktop",
+            "org.freedesktop.portal.Request",
+            "Response",
+            None,
+            None,
+            Gio.DBusSignalFlags.NONE,
+            on_response,
+        )
+        downloads = run(["xdg-user-dir", "DOWNLOAD"], check=False).stdout.strip() if shutil.which("xdg-user-dir") else ""
+        reply = bus.call_sync(
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.FileChooser",
+            "OpenFile",
+            file_chooser_options(f"openvpn_plugin_{os.getpid()}", Path(downloads) if downloads else None),
+            GLib.VariantType("(o)"),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
+        )
+        result["handle"] = reply.unpack()[0]
+        loop.run()
+        bus.signal_unsubscribe(subscription)
+    except GLib.Error as error:
+        raise WidgetError(f"Could not open the file chooser: {error.message}") from error
+
+    if result.get("code") != 0:
+        return ""
+    uris = result.get("values", {}).get("uris", [])
+    return uri_to_path(uris[0]) if uris else ""
+
+
+def command_pick_file(_args: argparse.Namespace) -> None:
+    emit({"ok": True, "path": pick_file()})
 
 
 def command_forget(args: argparse.Namespace) -> None:
@@ -664,6 +923,13 @@ def parser() -> argparse.ArgumentParser:
     create_parser = subparsers.add_parser("create-directory")
     create_parser.add_argument("--config-dir", default="~/.config/openvpn")
     create_parser.set_defaults(handler=command_create_directory)
+
+    subparsers.add_parser("pick-file").set_defaults(handler=command_pick_file)
+
+    add_parser = subparsers.add_parser("add-profile", help="copy a profile or zip bundle into the profiles directory")
+    add_parser.add_argument("--source", required=True)
+    add_parser.add_argument("--config-dir", default="~/.config/openvpn")
+    add_parser.set_defaults(handler=command_add_profile)
 
     for name, handler in (
         ("save-credentials", command_save_credentials),

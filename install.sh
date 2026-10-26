@@ -27,7 +27,7 @@ for argument in "$@"; do
 done
 
 PLUGIN_ID="rmarchei.openvpn"
-PACKAGES=(python openvpn networkmanager networkmanager-openvpn libsecret gnome-keyring)
+PACKAGES=(python python-gobject xdg-desktop-portal-gtk openvpn networkmanager networkmanager-openvpn libsecret gnome-keyring)
 PLUGIN_FILES=(manifest.json Panel.qml LICENSE scripts/openvpn-plugin)
 SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 DESTINATION="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$PLUGIN_ID"

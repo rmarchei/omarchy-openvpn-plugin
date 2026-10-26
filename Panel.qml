@@ -164,6 +164,7 @@ Panel {
   function actionCommand(kind, path) {
     if (kind === "disconnect-all") return [helperPath, kind]
     if (kind === "create-directory") return [helperPath, kind, "--config-dir", configDirectory]
+    if (kind === "add-profile") return [helperPath, kind, "--source", path, "--config-dir", configDirectory]
     var command = [helperPath, kind, "--config", path, "--config-dir", configDirectory]
     if (kind === "connect" && singleConnection) command.push("--exclusive")
     return command
@@ -178,6 +179,17 @@ Panel {
     errorMessage = ""
     actionProcess.command = actionCommand(kind, actionPath)
     actionProcess.running = true
+  }
+
+  // Opens the desktop file chooser; the chosen profile or zip bundle is then
+  // copied into the profiles directory by the add-profile action. The panel
+  // steps aside while the dialog is up and comes back with the result.
+  function addProfile() {
+    if (pickProcess.running || actionProcess.running) return
+    closeCredentials()
+    closeRename()
+    pickProcess.running = true
+    close()
   }
 
   function activate(profile) {
@@ -263,6 +275,23 @@ Panel {
   }
 
   Process {
+    id: pickProcess
+    running: false
+    command: [root.helperPath, "pick-file"]
+    stdout: StdioCollector { id: pickOutput; waitForEnd: true }
+    stderr: StdioCollector { id: pickError; waitForEnd: true }
+    onExited: function(exitCode) {
+      var result = root.parseResult(pickOutput.text)
+      root.open()
+      if (exitCode === 0 && result.ok) {
+        if (result.path) root.runAction("add-profile", result.path)
+      } else {
+        root.errorMessage = result.error || String(pickError.text || "Could not open the file chooser").trim()
+      }
+    }
+  }
+
+  Process {
     id: actionProcess
     running: false
     command: []
@@ -335,7 +364,10 @@ Panel {
       blocked: root.editPath !== "" || root.renamePath !== ""
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(text) { if (text === "r" || text === "R") root.refresh() }
+      onTextKey: function(text) {
+        if (text === "r" || text === "R") root.refresh()
+        else if (text === "a" || text === "A") root.addProfile()
+      }
 
       Flickable {
         anchors.fill: parent
@@ -402,18 +434,36 @@ Panel {
 
           PanelSeparator { width: parent.width; foreground: root.foreground }
 
-          PanelSectionHeader {
-            text: "PROFILES"
-            foreground: root.foreground
-            fontFamily: root.fontFamily
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              Layout.fillWidth: true
+              Layout.alignment: Qt.AlignVCenter
+              text: "PROFILES"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            PanelActionButton {
+              visible: root.profiles.length > 0
+              enabled: !pickProcess.running && !actionProcess.running
+              iconText: "󰐕"
+              tooltipText: "Add profile (.ovpn, .conf or .zip)"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              Layout.alignment: Qt.AlignVCenter
+              onClicked: root.addProfile()
+            }
           }
 
           Text {
             visible: root.profiles.length === 0 && root.shownError === ""
             width: parent.width
             text: root.directoryExists
-              ? "No .ovpn or .conf files in " + root.configDirectory + ". Add some there or choose another directory in the widget settings."
-              : root.configDirectory + " does not exist yet. Create it and add your .ovpn or .conf files, or choose another directory in the widget settings."
+              ? "No profiles in " + root.configDirectory + " yet. Add an .ovpn, .conf or .zip bundle, or copy files there."
+              : root.configDirectory + " does not exist yet. Add a profile to create it, or choose another directory in the widget settings."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -421,15 +471,27 @@ Panel {
             horizontalAlignment: Text.AlignHCenter
           }
 
-          Button {
-            visible: !root.directoryExists && root.profiles.length === 0 && root.shownError === ""
+          Row {
+            visible: root.profiles.length === 0 && root.shownError === ""
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "Create directory"
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            bordered: true
-            enabled: !actionProcess.running
-            onClicked: root.runAction("create-directory", "")
+            spacing: Style.space(8)
+
+            Button {
+              text: pickProcess.running ? "Choosing…" : "Add profile…"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              enabled: !pickProcess.running && !actionProcess.running
+              onClicked: root.addProfile()
+            }
+            Button {
+              visible: !root.directoryExists
+              text: "Create directory"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              enabled: !actionProcess.running
+              onClicked: root.runAction("create-directory", "")
+            }
           }
 
           Column {

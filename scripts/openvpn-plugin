@@ -187,6 +187,84 @@ def nm_vpn_data(uuid: str) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Live connection details
+
+
+def active_properties(uuid: str) -> dict[str, str]:
+    """The active-connection fields (GENERAL.*, IP4.*, VPN.*) of a connection.
+
+    Selecting VPN.* fields with --fields collides with the profile's vpn.*
+    setting, so the whole terse listing is read and the upper-case groups kept.
+    """
+    values: dict[str, str] = {}
+    for line in run(["nmcli", "--terse", "connection", "show", "uuid", uuid], check=False).stdout.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.split(".", 1)[0].isupper():
+            values[key] = value
+    return values
+
+
+def interface_addresses() -> dict[str, str]:
+    """Map each local address to its interface name."""
+    try:
+        interfaces = json.loads(run(["ip", "-json", "address"], check=False).stdout or "[]")
+    except (json.JSONDecodeError, WidgetError):
+        return {}
+    return {
+        entry["local"]: interface.get("ifname", "")
+        for interface in interfaces
+        for entry in interface.get("addr_info", [])
+        if entry.get("local")
+    }
+
+
+def format_server(gateway: str) -> str:
+    # NetworkManager reports the server as host:port:protocol.
+    parts = gateway.rsplit(":", 2)
+    if len(parts) == 3 and parts[1].isdigit():
+        return f"{parts[0]}:{parts[1]} {parts[2].upper()}"
+    return gateway
+
+
+def openvpn_started_at(uuid: str, proc: Path = Path("/proc")) -> float | None:
+    """When the openvpn process NetworkManager runs for this connection started.
+
+    NetworkManager-openvpn names the management socket after the connection
+    UUID, which identifies the process however the connection was started.
+    """
+    marker = f"nm-openvpn-{uuid}".encode()
+    try:
+        boot = next(int(line.split()[1]) for line in (proc / "stat").read_text().splitlines() if line.startswith("btime "))
+    except (OSError, StopIteration, ValueError, IndexError):
+        return None
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if (entry / "comm").read_text().strip() != "openvpn" or marker not in (entry / "cmdline").read_bytes():
+                continue
+            # Field 22 of /proc/<pid>/stat is the start time in clock ticks after boot;
+            # splitting after the parenthesised command name makes it index 19.
+            start_ticks = int((entry / "stat").read_text().rsplit(")", 1)[1].split()[19])
+            return boot + start_ticks / os.sysconf("SC_CLK_TCK")
+        except (OSError, IndexError, ValueError):
+            continue
+    return None
+
+
+def connection_details(uuid: str, addresses: dict[str, str]) -> dict[str, Any]:
+    values = active_properties(uuid)
+    address = values.get("IP4.ADDRESS[1]", "").split("/")[0] or values.get("IP6.ADDRESS[1]", "").split("/")[0]
+    return {
+        "address": address,
+        # GENERAL.IP-IFACE names the underlying device for VPNs, so find the tunnel by its address.
+        "device": addresses.get(address, ""),
+        "server": format_server(values.get("VPN.GATEWAY", "")),
+        "since": openvpn_started_at(uuid),
+    }
+
+
+# ---------------------------------------------------------------------------
 # OpenVPN configuration inspection
 
 
@@ -468,6 +546,7 @@ def command_list(args: argparse.Namespace) -> None:
     state = load_state()
     connections = nm_connections()
     secrets = stored_secret_index()
+    addresses: dict[str, str] | None = None
     changed = False
     profiles = []
 
@@ -490,6 +569,11 @@ def command_list(args: argparse.Namespace) -> None:
         required = info.required_secrets
         stored = [name for name in SECRET_FIELDS if key in secrets.get(name, set())]
         connection = connections.get(uuid)
+        details = None
+        if is_up(connection):
+            if addresses is None:
+                addresses = interface_addresses()
+            details = connection_details(uuid, addresses)
         profiles.append(
             {
                 "path": str(path),
@@ -507,6 +591,7 @@ def command_list(args: argparse.Namespace) -> None:
                 "storedSecrets": stored,
                 "hasSecrets": all(name in stored for name in required),
                 "problems": info.problems,
+                "details": details,
             }
         )
 

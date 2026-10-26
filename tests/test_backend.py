@@ -4,6 +4,7 @@ from importlib.machinery import SourceFileLoader
 from importlib.util import find_spec, module_from_spec, spec_from_loader
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -196,6 +197,8 @@ class DiscoveryTests(TempDirTestCase):
             patch.object(module, "load_state", return_value=state),
             patch.object(module, "nm_connections", return_value=connection("office-uuid", "OpenVPN · office", "activated")),
             patch.object(module, "stored_secret_index", return_value=secrets),
+            patch.object(module, "interface_addresses", return_value={"10.8.0.2": "tun0"}) as addresses,
+            patch.object(module, "connection_details", return_value={"device": "tun0"}) as details,
             patch.object(module, "save_state") as save_state,
             patch("sys.stdout", output),
             self.assertRaises(SystemExit),
@@ -210,6 +213,10 @@ class DiscoveryTests(TempDirTestCase):
         self.assertEqual(office_profile["requiredSecrets"], ["cert-pass"])
         self.assertTrue(office_profile["hasSecrets"])
         self.assertTrue(office_profile["active"])
+        # Live details are gathered for connected profiles only, with one address lookup.
+        self.assertEqual((home["details"], office_profile["details"]), (None, {"device": "tun0"}))
+        details.assert_called_once_with("office-uuid", {"10.8.0.2": "tun0"})
+        addresses.assert_called_once_with()
         save_state.assert_not_called()
 
 
@@ -337,6 +344,52 @@ class ConnectTests(TempDirTestCase):
             ):
                 module.command_connect(args)
             run.assert_not_called()
+
+
+class LiveDetailsTests(TempDirTestCase):
+    def test_active_properties_keep_only_live_fields(self):
+        output = "connection.id:Office\nvpn.data:remote = a\nIP4.ADDRESS[1]:10.8.0.2/24\nVPN.GATEWAY:vpn.example:443:tcp\nGENERAL.STATE:activated\n"
+        with patch.object(module, "run") as run:
+            run.return_value.stdout = output
+            self.assertEqual(
+                module.active_properties("u1"),
+                {"IP4.ADDRESS[1]": "10.8.0.2/24", "VPN.GATEWAY": "vpn.example:443:tcp", "GENERAL.STATE": "activated"},
+            )
+
+    def test_interface_addresses_map_addresses_to_devices(self):
+        payload = [
+            {"ifname": "lo", "addr_info": [{"local": "127.0.0.1"}]},
+            {"ifname": "tun0", "addr_info": [{"local": "10.8.0.2"}, {"local": "fd00::2"}]},
+            {"ifname": "eth0", "addr_info": []},
+        ]
+        with patch.object(module, "run") as run:
+            run.return_value.stdout = json.dumps(payload)
+            self.assertEqual(module.interface_addresses(), {"127.0.0.1": "lo", "10.8.0.2": "tun0", "fd00::2": "tun0"})
+            run.return_value.stdout = "not json"
+            self.assertEqual(module.interface_addresses(), {})
+
+    def test_format_server(self):
+        self.assertEqual(module.format_server("vpn-eu.example.com:443:tcp"), "vpn-eu.example.com:443 TCP")
+        self.assertEqual(module.format_server("[2001:db8::1]:1194:udp"), "[2001:db8::1]:1194 UDP")
+        self.assertEqual(module.format_server("203.0.113.7"), "203.0.113.7")
+        self.assertEqual(module.format_server(""), "")
+
+    def test_openvpn_start_time_comes_from_its_process(self):
+        proc = self.root / "proc"
+        self.write("proc/stat", "cpu 1 2 3\nbtime 1700000000\n")
+        ticks = os.sysconf("SC_CLK_TCK")
+        stat_tail = " ".join(["S"] + ["0"] * 18 + [str(ticks * 90)] + ["0"] * 5)
+        for pid, comm, cmdline in (
+            ("10", "nm-openvpn-serv", "--management\0/run/NetworkManager/nm-openvpn-u1\0"),
+            ("11", "openvpn", "/usr/sbin/openvpn\0--management\0/run/NetworkManager/nm-openvpn-u2\0"),
+            ("12", "openvpn", "/usr/sbin/openvpn\0--management\0/run/NetworkManager/nm-openvpn-u1\0"),
+        ):
+            self.write(f"proc/{pid}/comm", comm + "\n")
+            self.write(f"proc/{pid}/cmdline", cmdline)
+            self.write(f"proc/{pid}/stat", f"{pid} (open vpn) {stat_tail}\n")
+        self.write("proc/self/comm", "python")
+        self.assertEqual(module.openvpn_started_at("u1", proc), 1700000090)
+        self.assertIsNone(module.openvpn_started_at("u3", proc))
 
 
 class DeleteTests(TempDirTestCase):

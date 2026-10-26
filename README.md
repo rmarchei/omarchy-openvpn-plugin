@@ -21,6 +21,7 @@ Inspired by and based on [debba/omarchy-openvpn-widget](https://github.com/debba
   Certificates may be referenced by path (relative to the profile file) or inlined as `<ca>`, `<cert>`, `<key>`, `<pkcs12>`, and similar blocks. Missing certificate files are reported on the profile before NetworkManager is involved.
 - **Safe inline certificate imports.** NetworkManager writes inline certificates to `~/.local/share/networkmanagement/certificates/nm-openvpn/<file name>-<tag>.pem` and overwrites what is already there, so two profiles both named `client.ovpn` would end up sharing one key. This plugin imports such profiles under a unique name, and **Delete** removes the extracted key files.
 - **Add profiles from the panel.** Pick an `.ovpn`/`.conf` file or a `.zip` bundle in the desktop file chooser and the plugin copies it into your profile directory, along with any certificate files the profile references.
+- **Live details for connected profiles.** Download and upload rate, totals for the session, tunnel IP, server, and how long it has been connected, including for connections started outside the plugin. Traffic is sampled once a second, only while the panel is open.
 - Imports a profile into NetworkManager only when you first use it.
 - Custom display names, keyring-backed credentials, and themed Omarchy UI.
 

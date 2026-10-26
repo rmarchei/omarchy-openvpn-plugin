@@ -45,6 +45,15 @@ Panel {
   property string actionInput: ""
   property bool connectAfterSave: false
 
+  // Tunnel traffic, sampled only while the panel is open:
+  // device -> { rx, tx, time, rxRate, txRate }. Rates need two samples.
+  property var traffic: ({})
+  property real now: Date.now() / 1000
+  readonly property var trafficDevices: activeProfiles
+    .map(function(profile) { return profile.details ? profile.details.device : "" })
+    .filter(function(device) { return device !== "" })
+  readonly property string trafficScript: 'for device; do printf "%s %s %s\\n" "$device" "$(cat /sys/class/net/$device/statistics/rx_bytes 2>/dev/null)" "$(cat /sys/class/net/$device/statistics/tx_bytes 2>/dev/null)"; done'
+
   implicitWidth: barButton.implicitWidth
   implicitHeight: barButton.implicitHeight
 
@@ -71,6 +80,36 @@ Panel {
     if (connecting) return "Connecting"
     if (activeProfiles.length > 1) return activeProfiles.length + " connected"
     return anyActive ? "Connected" : "Disconnected"
+  }
+
+  function formatBytes(bytes) {
+    var n = Number(bytes)
+    if (!isFinite(n) || n < 0) n = 0
+    if (n < 1024) return Math.round(n) + " B"
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB"
+    if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB"
+    return (n / (1024 * 1024 * 1024)).toFixed(2) + " GB"
+  }
+
+  function formatDuration(seconds) {
+    var total = Math.max(0, Math.floor(seconds))
+    var days = Math.floor(total / 86400)
+    var hours = Math.floor(total % 86400 / 3600)
+    var minutes = Math.floor(total % 3600 / 60)
+    if (days > 0) return days + "d " + hours + "h"
+    if (hours > 0) return hours + "h " + minutes + "m"
+    if (minutes > 0) return minutes + "m " + (total % 60) + "s"
+    return (total % 60) + "s"
+  }
+
+  function rateText(device, key) {
+    var sample = traffic[device]
+    return sample && sample[key] !== undefined ? formatBytes(sample[key]) + "/s" : "--"
+  }
+
+  function totalText(device, key) {
+    var sample = traffic[device]
+    return sample ? formatBytes(sample[key]) : "--"
   }
 
   function authLabel(profile) {
@@ -232,6 +271,7 @@ Panel {
     } else {
       message = ""
       errorMessage = ""
+      traffic = ({})
     }
   }
 
@@ -320,6 +360,44 @@ Panel {
         root.connectAfterSave = false
         root.refresh()
       }
+    }
+  }
+
+  Timer {
+    interval: 1000
+    repeat: true
+    running: root.opened && root.trafficDevices.length > 0
+    triggeredOnStart: true
+    onTriggered: {
+      root.now = Date.now() / 1000
+      if (trafficProcess.running) return
+      trafficProcess.command = ["sh", "-c", root.trafficScript, "sh"].concat(root.trafficDevices)
+      trafficProcess.running = true
+    }
+  }
+
+  Process {
+    id: trafficProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: trafficOutput; waitForEnd: true }
+    onExited: {
+      var sampled = Date.now() / 1000
+      var next = {}
+      var lines = String(trafficOutput.text || "").split("\n")
+      for (var index = 0; index < lines.length; index++) {
+        var fields = lines[index].trim().split(/\s+/)
+        if (fields.length < 3) continue
+        var sample = { rx: Number(fields[1]), tx: Number(fields[2]), time: sampled }
+        if (!isFinite(sample.rx) || !isFinite(sample.tx)) continue
+        var previous = root.traffic[fields[0]]
+        if (previous && sampled > previous.time && sample.rx >= previous.rx && sample.tx >= previous.tx) {
+          sample.rxRate = (sample.rx - previous.rx) / (sampled - previous.time)
+          sample.txRate = (sample.tx - previous.tx) / (sampled - previous.time)
+        }
+        next[fields[0]] = sample
+      }
+      root.traffic = next
     }
   }
 
@@ -490,19 +568,24 @@ Panel {
                 readonly property bool busy: root.actionPath === modelData.path
                 readonly property bool live: modelData.active || modelData.state === "activating"
                 readonly property bool confirmingDelete: root.deletePath === modelData.path
+                readonly property var details: modelData.details || ({})
                 width: parent.width
-                implicitHeight: profileRow.implicitHeight + Style.space(12)
+                implicitHeight: profileColumn.implicitHeight + Style.space(12)
                 current: modelData.active
                 foreground: root.foreground
 
+                // Only the summary row toggles the connection; the details are read-only.
                 MouseArea {
-                  anchors.fill: parent
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.top: parent.top
+                  height: profileColumn.y + profileRow.height + Style.space(6)
                   cursorShape: Qt.PointingHandCursor
                   onClicked: root.activate(profileItem.modelData)
                 }
 
-                RowLayout {
-                  id: profileRow
+                ColumnLayout {
+                  id: profileColumn
                   anchors.left: parent.left
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
@@ -510,88 +593,124 @@ Panel {
                   anchors.rightMargin: Style.space(6)
                   spacing: Style.space(8)
 
-                  Text {
-                    text: profileItem.live ? "󰖂" : (profileItem.modelData.auth === "password" ? "󰦝" : "󰄤")
-                    color: profileItem.live ? root.foreground : root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.icon
-                    Layout.alignment: Qt.AlignVCenter
-                  }
-
-                  ColumnLayout {
+                  RowLayout {
+                    id: profileRow
                     Layout.fillWidth: true
-                    spacing: Style.space(1)
+                    spacing: Style.space(8)
 
                     Text {
-                      Layout.fillWidth: true
-                      text: profileItem.modelData.name
-                      color: root.foreground
+                      id: profileIcon
+                      text: profileItem.live ? "󰖂" : (profileItem.modelData.auth === "password" ? "󰦝" : "󰄤")
+                      color: profileItem.live ? root.foreground : root.dim
                       font.family: root.fontFamily
-                      font.pixelSize: Style.font.body
-                      font.bold: profileItem.modelData.active
-                      elide: Text.ElideRight
+                      font.pixelSize: Style.font.icon
+                      Layout.alignment: Qt.AlignVCenter
                     }
-                    Text {
+
+                    ColumnLayout {
                       Layout.fillWidth: true
-                      text: root.authLabel(profileItem.modelData) + " · " + root.statusLabel(profileItem.modelData)
-                      color: profileItem.modelData.problems.length > 0 && !profileItem.live ? root.urgent : root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      elide: Text.ElideRight
+                      spacing: Style.space(1)
+
+                      Text {
+                        Layout.fillWidth: true
+                        text: profileItem.modelData.name
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                        font.bold: profileItem.modelData.active
+                        elide: Text.ElideRight
+                      }
+                      Text {
+                        Layout.fillWidth: true
+                        text: root.authLabel(profileItem.modelData) + " · " + root.statusLabel(profileItem.modelData)
+                        color: profileItem.modelData.problems.length > 0 && !profileItem.live ? root.urgent : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        elide: Text.ElideRight
+                      }
+                    }
+
+                    PanelActionButton {
+                      visible: !profileItem.live
+                      enabled: !actionProcess.running && profileItem.modelData.problems.length === 0
+                      iconText: "󰍂"
+                      tooltipText: "Connect"
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      Layout.alignment: Qt.AlignVCenter
+                      onClicked: root.activate(profileItem.modelData)
+                    }
+
+                    PanelActionButton {
+                      visible: !profileItem.live
+                      iconText: "󰏫"
+                      tooltipText: "Rename profile"
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      Layout.alignment: Qt.AlignVCenter
+                      onClicked: root.openRename(profileItem.modelData)
+                    }
+
+                    PanelActionButton {
+                      visible: !profileItem.live && profileItem.modelData.requiredSecrets.length > 0
+                      iconText: "󰌆"
+                      tooltipText: profileItem.modelData.auth === "certificate" ? "Edit key passphrase" : "Edit keyring credentials"
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      Layout.alignment: Qt.AlignVCenter
+                      onClicked: root.openCredentials(profileItem.modelData, false)
+                    }
+
+                    PanelActionButton {
+                      visible: !profileItem.live
+                      enabled: !actionProcess.running
+                      iconText: "󰆴"
+                      tooltipText: profileItem.confirmingDelete ? "Click again to delete " + profileItem.modelData.relativePath : "Delete profile"
+                      foreground: profileItem.confirmingDelete ? root.urgent : root.foreground
+                      fontFamily: root.fontFamily
+                      Layout.alignment: Qt.AlignVCenter
+                      onClicked: root.deleteProfile(profileItem.modelData)
+                    }
+
+                    PanelActionButton {
+                      visible: profileItem.live
+                      enabled: !profileItem.busy
+                      iconText: "󰍃"
+                      tooltipText: "Disconnect"
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      Layout.alignment: Qt.AlignVCenter
+                      onClicked: root.runAction("disconnect", profileItem.modelData.path)
                     }
                   }
 
-                  PanelActionButton {
-                    visible: !profileItem.live
-                    enabled: !actionProcess.running && profileItem.modelData.problems.length === 0
-                    iconText: "󰍂"
-                    tooltipText: "Connect"
-                    foreground: root.foreground
-                    fontFamily: root.fontFamily
-                    Layout.alignment: Qt.AlignVCenter
-                    onClicked: root.activate(profileItem.modelData)
-                  }
+                  GridLayout {
+                    visible: profileItem.modelData.active && profileItem.modelData.details !== null
+                    Layout.fillWidth: true
+                    // Lines up with the profile name, past the status icon.
+                    Layout.leftMargin: profileIcon.width + profileRow.spacing
+                    Layout.rightMargin: Style.space(4)
+                    // Two equal columns of label/value pairs: widths never follow the
+                    // numbers, so values change in place instead of shifting the grid.
+                    columns: 2
+                    uniformCellWidths: true
+                    columnSpacing: Style.space(20)
+                    rowSpacing: Style.spacing.labelGap
 
-                  PanelActionButton {
-                    visible: !profileItem.live
-                    iconText: "󰏫"
-                    tooltipText: "Rename profile"
-                    foreground: root.foreground
-                    fontFamily: root.fontFamily
-                    Layout.alignment: Qt.AlignVCenter
-                    onClicked: root.openRename(profileItem.modelData)
-                  }
-
-                  PanelActionButton {
-                    visible: !profileItem.live && profileItem.modelData.requiredSecrets.length > 0
-                    iconText: "󰌆"
-                    tooltipText: profileItem.modelData.auth === "certificate" ? "Edit key passphrase" : "Edit keyring credentials"
-                    foreground: root.foreground
-                    fontFamily: root.fontFamily
-                    Layout.alignment: Qt.AlignVCenter
-                    onClicked: root.openCredentials(profileItem.modelData, false)
-                  }
-
-                  PanelActionButton {
-                    visible: !profileItem.live
-                    enabled: !actionProcess.running
-                    iconText: "󰆴"
-                    tooltipText: profileItem.confirmingDelete ? "Click again to delete " + profileItem.modelData.relativePath : "Delete profile"
-                    foreground: profileItem.confirmingDelete ? root.urgent : root.foreground
-                    fontFamily: root.fontFamily
-                    Layout.alignment: Qt.AlignVCenter
-                    onClicked: root.deleteProfile(profileItem.modelData)
-                  }
-
-                  PanelActionButton {
-                    visible: profileItem.live
-                    enabled: !profileItem.busy
-                    iconText: "󰍃"
-                    tooltipText: "Disconnect"
-                    foreground: root.foreground
-                    fontFamily: root.fontFamily
-                    Layout.alignment: Qt.AlignVCenter
-                    onClicked: root.runAction("disconnect", profileItem.modelData.path)
+                    DetailPair { label: "Receiving"; value: root.rateText(profileItem.details.device, "rxRate") }
+                    DetailPair { label: "Sending"; value: root.rateText(profileItem.details.device, "txRate") }
+                    DetailPair { label: "Downloaded"; value: root.totalText(profileItem.details.device, "rx") }
+                    DetailPair { label: "Uploaded"; value: root.totalText(profileItem.details.device, "tx") }
+                    DetailPair { label: "Tunnel IP"; value: profileItem.details.address || "--" }
+                    DetailPair {
+                      label: "Connected"
+                      value: profileItem.details.since ? root.formatDuration(root.now - profileItem.details.since) : "--"
+                    }
+                    DetailPair {
+                      Layout.columnSpan: 2
+                      label: "Server"
+                      value: profileItem.details.server || "--"
+                    }
                   }
                 }
               }
@@ -715,5 +834,34 @@ Panel {
         }
       }
     }
+  }
+
+  component InfoLabel: Text {
+    textFormat: Text.PlainText
+    color: root.foreground
+    opacity: 0.6
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.bodySmall
+  }
+
+  component InfoValue: Text {
+    textFormat: Text.PlainText
+    color: root.foreground
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.bodySmall
+    horizontalAlignment: Text.AlignRight
+    elide: Text.ElideMiddle
+    Layout.fillWidth: true
+  }
+
+  component DetailPair: RowLayout {
+    id: pair
+    property string label: ""
+    property string value: "--"
+    Layout.fillWidth: true
+    spacing: Style.space(8)
+
+    InfoLabel { text: pair.label }
+    InfoValue { text: pair.value }
   }
 }

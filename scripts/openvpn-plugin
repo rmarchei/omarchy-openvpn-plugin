@@ -838,7 +838,9 @@ def add_profile_file(source: Path, directory: Path) -> list[Path]:
         relative = PurePosixPath(reference)
         referenced = (source.parent / reference).resolve()
         if ".." in relative.parts or not referenced.is_relative_to(source.parent.resolve()):
-            raise WidgetError(f"{source.name} references {reference} outside its folder; copy the folder into your profiles directory instead")
+            raise WidgetError(
+                f"{source.name} references {reference} outside its folder; copy the folder into your profiles directory instead"
+            )
         if not referenced.is_file():
             raise WidgetError(f"{source.name} references {reference}, which was not found next to it")
         files[str(relative)] = referenced
@@ -1030,7 +1032,7 @@ def delete_profile_files(path: Path, directory: Path) -> None:
     # Any profile in the directory may share a file, including one in another folder that reaches it with ../.
     others = [other for other in discover(directory) if other != path]
     still_used = {resolve_reference(other.parent, reference).resolve() for other in others for reference in file_references(other)}
-    deleted = sorted(owned_references(path) - still_used - {path}) + [path]
+    deleted = [*sorted(owned_references(path) - still_used - {path}), path]
     for target in deleted:
         target.unlink(missing_ok=True)
 

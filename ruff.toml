@@ -1,0 +1,13 @@
+# The backend is an executable script without a .py suffix.
+extend-include = ["scripts/openvpn-plugin"]
+line-length = 140
+# py313, not py314: the formatter would drop the parentheses in `except (A, B):`,
+# a 3.14-only form that reads like Python 2's `except A, name:`.
+target-version = "py313"
+
+[lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[lint.isort]
+# Keep `import x` and `from x import y` in one alphabetical run, as the code already does.
+force-sort-within-sections = true

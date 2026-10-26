@@ -144,8 +144,12 @@ omarchy-shell rmarchei.openvpn disconnectAll
 
 ```bash
 python -m unittest discover -s tests -v
+ruff check .
+ruff format --check .
 omarchy plugin validate .
 ```
+
+CI runs the tests on Python 3.14 and 3.15, plus both ruff checks.
 
 The backend can be run on its own:
 

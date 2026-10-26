@@ -53,11 +53,14 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(module.escape_secret("plain"), "plain")
         self.assertEqual(module.escape_secret(" a\\b "), "\\040a\\134b\\040")
         self.assertEqual(module.escape_secret("tab\there"), "tab\\011here")
-        # Octal escapes produce single bytes, so non-ASCII text must pass through untouched.
-        self.assertEqual(module.escape_secret("pässwörd "), "pässwörd ")
+        # Octal escapes produce single bytes, so non-ASCII text must pass through untouched (the no-break spaces are deliberate).
+        self.assertEqual(module.escape_secret("pässwörd "), "pässwörd ")  # noqa: RUF001
 
     def test_vpn_data_parsing_unescapes_values(self):
-        output = "ca = /home/u/.local/share/networkmanagement/certificates/nm-openvpn/.office-12345678-ca.pem, connection-type = tls, remote = a\\:1194\n"
+        output = (
+            "ca = /home/u/.local/share/networkmanagement/certificates/nm-openvpn/.office-12345678-ca.pem, "
+            "connection-type = tls, remote = a\\:1194\n"
+        )
         with patch.object(module, "run") as run:
             run.return_value.stdout = output
             self.assertEqual(
@@ -165,8 +168,16 @@ class DiscoveryTests(TempDirTestCase):
         profile = self.write("profiles/office/client.ovpn", CLIENT + f"key certs/client.key\nca {outside}\n")
         flat = self.write("profiles/home.ovpn", CLIENT)
         (profiles / "link.ovpn").symlink_to(outside)
-        for path, mode in ((profiles, 0o755), (profiles / "office", 0o755), (key.parent, 0o755), (key, 0o644),
-                           (notes, 0o644), (outside, 0o644), (profile, 0o755), (flat, 0o664)):
+        for path, mode in (
+            (profiles, 0o755),
+            (profiles / "office", 0o755),
+            (key.parent, 0o755),
+            (key, 0o644),
+            (notes, 0o644),
+            (outside, 0o644),
+            (profile, 0o755),
+            (flat, 0o664),
+        ):
             path.chmod(mode)
 
         self.run_list(profiles)
@@ -292,7 +303,9 @@ class ConnectTests(TempDirTestCase):
         with (
             patch.object(module, "secret_lookup", side_effect=lambda _path, name: secrets.get(name, "")),
             patch.object(module, "load_state", return_value=state),
-            patch.object(module, "nm_connections", return_value={**connection("u1", "OpenVPN · c"), **connection("u2", "Other", "activated")}),
+            patch.object(
+                module, "nm_connections", return_value={**connection("u1", "OpenVPN · c"), **connection("u2", "Other", "activated")}
+            ),
             patch.object(module, "run", side_effect=fake_run) as run,
             patch("sys.stdout", io.StringIO()) as output,
             self.assertRaises(SystemExit),
@@ -348,7 +361,10 @@ class ConnectTests(TempDirTestCase):
 
 class LiveDetailsTests(TempDirTestCase):
     def test_active_properties_keep_only_live_fields(self):
-        output = "connection.id:Office\nvpn.data:remote = a\nIP4.ADDRESS[1]:10.8.0.2/24\nVPN.GATEWAY:vpn.example:443:tcp\nGENERAL.STATE:activated\n"
+        output = (
+            "connection.id:Office\nvpn.data:remote = a\nIP4.ADDRESS[1]:10.8.0.2/24\n"
+            "VPN.GATEWAY:vpn.example:443:tcp\nGENERAL.STATE:activated\n"
+        )
         with patch.object(module, "run") as run:
             run.return_value.stdout = output
             self.assertEqual(
@@ -497,7 +513,9 @@ class AddProfileTests(TempDirTestCase):
         result = self.add(source)
         folder = self.profiles / "office"
         self.assertEqual(result["added"], [str(folder / "client.ovpn")])
-        self.assertEqual(sorted(str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file()), ["certs/client.crt", "client.key", "client.ovpn"])
+        self.assertEqual(
+            sorted(str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file()), ["certs/client.crt", "client.key", "client.ovpn"]
+        )
         self.assertEqual(module.inspect_config(folder / "client.ovpn").problems, [])
         self.assertEqual(self.mode(folder / "client.key"), 0o600)
         self.assertEqual(list(self.profiles.glob(".import-*")), [])

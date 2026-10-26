@@ -36,7 +36,11 @@ Panel {
   property string passphraseText: ""
   property string forgetPath: ""
   property string message: ""
+  // Action errors last until the panel closes or the next action starts;
+  // list errors until the backend answers a refresh again.
   property string errorMessage: ""
+  property string listErrorMessage: ""
+  readonly property string shownError: errorMessage !== "" ? errorMessage : listErrorMessage
   property string actionKind: ""
   property string actionPath: ""
   property string actionInput: ""
@@ -212,7 +216,20 @@ Panel {
 
   onOpenedChanged: {
     forgetPath = ""
-    if (opened) refresh()
+    if (opened) {
+      refresh()
+    } else {
+      message = ""
+      errorMessage = ""
+    }
+  }
+
+  onMessageChanged: if (message !== "") messageTimer.restart()
+
+  Timer {
+    id: messageTimer
+    interval: 4000
+    onTriggered: root.message = ""
   }
 
   IpcHandler {
@@ -238,8 +255,9 @@ Panel {
         root.profiles = result.profiles || []
         // A missing directory is the normal first-run state, not an error.
         root.directoryExists = result.directoryExists !== false
+        root.listErrorMessage = ""
       } else {
-        root.errorMessage = result.error || String(listError.text || "Could not load OpenVPN profiles").trim()
+        root.listErrorMessage = result.error || String(listError.text || "Could not load OpenVPN profiles").trim()
       }
     }
   }
@@ -292,7 +310,9 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: root.anyActive ? "󰖂" : "󰦝"
-    active: root.anyActive
+    // `active` paints the icon in the urgent color, so it flags problems only;
+    // the glyph alone shows whether a profile is connected.
+    active: root.shownError !== ""
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.MiddleButton) root.refresh()
       else root.toggle()
@@ -371,19 +391,10 @@ Panel {
           }
 
           Text {
+            visible: root.message !== "" || root.shownError !== ""
             width: parent.width
-            text: root.configDirectory
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideMiddle
-          }
-
-          Text {
-            visible: root.message !== "" || root.errorMessage !== ""
-            width: parent.width
-            text: root.errorMessage !== "" ? root.errorMessage : root.message
-            color: root.errorMessage !== "" ? root.urgent : root.dim
+            text: root.shownError !== "" ? root.shownError : root.message
+            color: root.shownError !== "" ? root.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
@@ -398,11 +409,11 @@ Panel {
           }
 
           Text {
-            visible: root.profiles.length === 0 && root.errorMessage === ""
+            visible: root.profiles.length === 0 && root.shownError === ""
             width: parent.width
             text: root.directoryExists
-              ? "No .ovpn or .conf files found. Add some to this directory or choose another one in the widget settings."
-              : "This directory does not exist yet. Create it and add your .ovpn or .conf files, or choose another directory in the widget settings."
+              ? "No .ovpn or .conf files in " + root.configDirectory + ". Add some there or choose another directory in the widget settings."
+              : root.configDirectory + " does not exist yet. Create it and add your .ovpn or .conf files, or choose another directory in the widget settings."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -411,7 +422,7 @@ Panel {
           }
 
           Button {
-            visible: !root.directoryExists && root.profiles.length === 0 && root.errorMessage === ""
+            visible: !root.directoryExists && root.profiles.length === 0 && root.shownError === ""
             anchors.horizontalCenter: parent.horizontalCenter
             text: "Create directory"
             foreground: root.foreground

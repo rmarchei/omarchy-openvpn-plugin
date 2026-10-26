@@ -1,0 +1,686 @@
+#!/usr/bin/env python3
+"""NetworkManager/OpenVPN backend for the Omarchy OpenVPN plugin."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from typing import Any
+
+APP_ID = "omarchy-openvpn-plugin"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / APP_ID
+STATE_FILE = STATE_DIR / "profiles.json"
+SUPPORTED_SUFFIXES = {".ovpn", ".conf"}
+# The configuration directory itself plus one level of per-profile folders,
+# which is how most providers ship certificate bundles.
+SCAN_DEPTH = 1
+SECRET_FIELDS = ("username", "password", "cert-pass")
+SECRET_LABELS = {"username": "username", "password": "password", "cert-pass": "private key passphrase"}
+# NM_SETTING_SECRET_FLAG_NOT_SAVED: NetworkManager never persists the secret and
+# asks a secret agent (here, nmcli's passwd-file) on every activation.
+SECRET_FLAG_NOT_SAVED = "2"
+FILE_DIRECTIVES = {
+    "ca",
+    "cert",
+    "key",
+    "pkcs12",
+    "tls-auth",
+    "tls-crypt",
+    "tls-crypt-v2",
+    "secret",
+    "extra-certs",
+    "crl-verify",
+}
+ENCRYPTED_KEY_MARKERS = ("Proc-Type: 4,ENCRYPTED", "-----BEGIN ENCRYPTED PRIVATE KEY-----")
+
+
+class WidgetError(RuntimeError):
+    """An error safe to display in the widget."""
+
+
+@dataclass
+class ConfigInfo:
+    """What an OpenVPN client file needs in order to authenticate."""
+
+    user_pass: bool = False
+    certificate: bool = False
+    pkcs12: bool = False
+    key_encrypted: bool = False
+    static_key: bool = False
+    client: bool = False
+    remote: bool = False
+    inline: bool = False
+    problems: list[str] = field(default_factory=list)
+
+    @property
+    def auth(self) -> str:
+        if self.user_pass and self.certificate:
+            return "password-certificate"
+        if self.certificate:
+            return "certificate"
+        if self.user_pass:
+            return "password"
+        if self.static_key:
+            return "static-key"
+        return "none"
+
+    @property
+    def required_secrets(self) -> list[str]:
+        fields: list[str] = []
+        if self.user_pass:
+            fields += ["username", "password"]
+        if self.certificate and self.key_encrypted:
+            fields.append("cert-pass")
+        return fields
+
+
+def run(command: list[str], *, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(command, input=input_text, text=True, capture_output=True, check=False)
+    except FileNotFoundError as error:
+        raise WidgetError(f"Required command not found: {command[0]}") from error
+    if check and result.returncode != 0:
+        message = (result.stderr or result.stdout or f"{command[0]} failed").strip()
+        raise WidgetError(" ".join(message.split()))
+    return result
+
+
+def emit(payload: dict[str, Any], exit_code: int = 0) -> None:
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    raise SystemExit(exit_code)
+
+
+def expand_path(raw: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(raw)))
+
+
+def expand_directory(raw: str) -> Path:
+    return expand_path(raw or "~/.config/openvpn").resolve()
+
+
+def config_key(path: Path) -> str:
+    return hashlib.sha256(str(path.resolve()).encode()).hexdigest()
+
+
+def load_state() -> dict[str, dict[str, Any]]:
+    try:
+        value = json.loads(STATE_FILE.read_text())
+        return value if isinstance(value, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_state(state: dict[str, dict[str, Any]]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = STATE_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, indent=2) + "\n")
+    os.chmod(temporary, 0o600)
+    temporary.replace(STATE_FILE)
+
+
+def parse_terse_line(line: str) -> list[str]:
+    fields: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for character in line.rstrip("\n"):
+        if escaped:
+            current.append(character)
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == ":":
+            fields.append("".join(current))
+            current = []
+        else:
+            current.append(character)
+    if escaped:
+        current.append("\\")
+    fields.append("".join(current))
+    return fields
+
+
+def nm_connections() -> dict[str, dict[str, str]]:
+    output = run(["nmcli", "--terse", "--escape", "yes", "--fields", "UUID,NAME,TYPE,STATE", "connection", "show"]).stdout
+    connections: dict[str, dict[str, str]] = {}
+    for line in output.splitlines():
+        fields = parse_terse_line(line)
+        if len(fields) < 4:
+            continue
+        uuid, name, connection_type, state = fields[:4]
+        connections[uuid] = {"uuid": uuid, "name": name, "type": connection_type, "state": state}
+    return connections
+
+
+def is_up(connection: dict[str, str] | None) -> bool:
+    return bool(connection) and connection.get("state") in {"activating", "activated"}
+
+
+def nm_vpn_data(uuid: str) -> dict[str, str]:
+    output = run(["nmcli", "--get-values", "vpn.data", "connection", "show", "uuid", uuid], check=False).stdout
+    data: dict[str, str] = {}
+    for item in output.strip().split(", "):
+        key, separator, value = item.partition(" = ")
+        if separator:
+            data[key.strip()] = re.sub(r"\\(.)", r"\1", value.strip())
+    return data
+
+
+# ---------------------------------------------------------------------------
+# OpenVPN configuration inspection
+
+
+def tokenize(line: str) -> list[str]:
+    try:
+        return shlex.split(line, posix=True)
+    except ValueError:
+        return line.split()
+
+
+def read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(errors="replace")
+    except OSError:
+        return None
+
+
+def pem_is_encrypted(text: str) -> bool:
+    # Mirrors NetworkManager-openvpn's is_encrypted() check for PEM keys.
+    return any(line.strip().startswith(ENCRYPTED_KEY_MARKERS) for line in text.splitlines())
+
+
+def resolve_reference(base: Path, raw: str) -> Path:
+    # NetworkManager resolves relative paths against the imported file's directory.
+    path = expand_path(raw)
+    return path if path.is_absolute() else base / path
+
+
+def inspect_config(path: Path) -> ConfigInfo:
+    info = ConfigInfo()
+    text = read_text(path)
+    if text is None:
+        info.problems.append("Cannot read the configuration file")
+        return info
+
+    # Each file directive maps to ("file", path) or ("inline", contents); like
+    # OpenVPN, the last occurrence wins.
+    sources: dict[str, tuple[str, str]] = {}
+    block: str | None = None
+    block_lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if block is not None:
+            if line == f"</{block}>":
+                if block in FILE_DIRECTIVES:
+                    sources[block] = ("inline", "\n".join(block_lines))
+                elif block == "connection" and any(tokenize(entry)[:1] == ["remote"] for entry in block_lines):
+                    info.remote = True
+                block = None
+            else:
+                block_lines.append(line)
+            continue
+        if not line or line[0] in "#;":
+            continue
+        tag = re.fullmatch(r"<([A-Za-z0-9-]+)>", line)
+        if tag:
+            block, block_lines = tag.group(1), []
+            continue
+
+        tokens = tokenize(line)
+        if not tokens:
+            continue
+        directive = tokens[0].removeprefix("--")
+        if directive in {"client", "tls-client"}:
+            info.client = True
+        elif directive == "remote":
+            info.remote = True
+        elif directive == "auth-user-pass":
+            info.user_pass = True
+        elif directive in FILE_DIRECTIVES and len(tokens) > 1 and tokens[1] != "[inline]":
+            sources[directive] = ("file", tokens[1])
+
+    info.inline = any(kind == "inline" for kind, _ in sources.values())
+    info.static_key = "secret" in sources
+    info.pkcs12 = "pkcs12" in sources
+    info.certificate = info.pkcs12 or "cert" in sources
+
+    for directive, (kind, value) in sources.items():
+        if kind == "file" and not resolve_reference(path.parent, value).exists():
+            info.problems.append(f"Missing {directive} file: {value}")
+
+    if info.pkcs12:
+        # NetworkManager always asks for a passphrase to open a PKCS#12 bundle.
+        info.key_encrypted = True
+    elif "key" in sources:
+        kind, value = sources["key"]
+        key_text = value if kind == "inline" else read_text(resolve_reference(path.parent, value))
+        info.key_encrypted = pem_is_encrypted(key_text or "")
+
+    if not info.client and not info.static_key:
+        info.problems.append("Not an OpenVPN client configuration")
+    if not info.remote:
+        info.problems.append("No remote server defined")
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Secret Service
+
+
+def secret_attributes(path: Path, field_name: str | None = None) -> list[str]:
+    attributes = ["service", APP_ID, "config", config_key(path)]
+    if field_name:
+        attributes += ["field", field_name]
+    return attributes
+
+
+def secret_lookup(path: Path, field_name: str) -> str:
+    result = run(["secret-tool", "lookup", *secret_attributes(path, field_name)], check=False)
+    return result.stdout.rstrip("\n") if result.returncode == 0 else ""
+
+
+def secret_store(path: Path, field_name: str, value: str) -> None:
+    label = f"OpenVPN {SECRET_LABELS[field_name]} for {path.stem}"
+    run(["secret-tool", "store", "--label", label, *secret_attributes(path, field_name)], input_text=value)
+
+
+def secret_clear(path: Path) -> None:
+    run(["secret-tool", "clear", *secret_attributes(path)], check=False)
+
+
+def stored_secret_index() -> dict[str, set[str]]:
+    """Map each stored secret field to the config keys that have it.
+
+    One search per field instead of one lookup per profile and field keeps a
+    refresh cheap with many profiles, and works while the keyring is locked
+    because only item attributes are inspected.
+    """
+    index: dict[str, set[str]] = {}
+    for field_name in SECRET_FIELDS:
+        result = run(["secret-tool", "search", "--all", "service", APP_ID, "field", field_name], check=False)
+        output = f"{result.stdout}\n{result.stderr}"
+        index[field_name] = set(re.findall(r"^attribute\.config = ([0-9a-f]{64})$", output, re.MULTILINE))
+    return index
+
+
+def escape_secret(value: str) -> str:
+    """Escape a value for an nmcli passwd-file line.
+
+    nmcli unescapes backslash sequences and strips unescaped leading and
+    trailing whitespace, so backslashes, spaces and ASCII control characters
+    are written as three-digit octal escapes. Non-ASCII characters are left
+    alone because octal escapes produce single bytes.
+    """
+    return "".join(
+        f"\\{ord(character):03o}" if character in "\\ " or ord(character) < 0x20 or ord(character) == 0x7F else character
+        for character in value
+    )
+
+
+# ---------------------------------------------------------------------------
+# Profiles
+
+
+def discover(directory: Path, depth: int = SCAN_DEPTH) -> list[Path]:
+    if not directory.is_dir():
+        return []
+    found: list[Path] = []
+    try:
+        entries = sorted(directory.iterdir(), key=lambda item: item.name.casefold())
+    except OSError:
+        return []
+    for item in entries:
+        if item.name.startswith("."):
+            continue
+        if item.is_file() and item.suffix.lower() in SUPPORTED_SUFFIXES:
+            found.append(item.resolve())
+        elif item.is_dir() and depth > 0:
+            found.extend(discover(item, depth - 1))
+    return found
+
+
+def require_config(raw: str) -> Path:
+    path = expand_path(raw).resolve()
+    if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
+        raise WidgetError("The selected OpenVPN configuration does not exist")
+    return path
+
+
+def default_name(path: Path, directory: Path | None = None) -> str:
+    # Per-profile folders often contain a generic "client.ovpn"; prefer the folder name.
+    if directory and path.parent != directory and path.stem.casefold() in {"client", "config", "openvpn", "profile"}:
+        return path.parent.name
+    return path.stem
+
+
+def unique_connection_name(name: str, connections: dict[str, dict[str, str]]) -> str:
+    base = f"OpenVPN · {name}"
+    names = {entry["name"] for entry in connections.values()}
+    if base not in names:
+        return base
+    index = 2
+    while f"{base} ({index})" in names:
+        index += 1
+    return f"{base} ({index})"
+
+
+def import_alias(path: Path) -> Path:
+    return path.parent / f".{path.stem}-{config_key(path)[:8]}{path.suffix}"
+
+
+def import_profile(path: Path, info: ConfigInfo) -> tuple[str, list[str]]:
+    """Import ``path`` into NetworkManager and return its UUID and inline blob files.
+
+    NetworkManager writes inline <ca>/<cert>/<key> blocks to
+    ``<cert dir>/<file basename>-<tag>.pem`` and overwrites existing files, so two
+    profiles named client.ovpn would share whichever key was imported last.
+    Profiles with inline blocks are therefore imported through a uniquely
+    named link placed next to the original, which keeps relative certificate
+    paths valid.
+    """
+    before = set(nm_connections())
+    source = path
+    alias: Path | None = None
+    if info.inline:
+        alias = import_alias(path)
+        try:
+            alias.unlink(missing_ok=True)
+            alias.symlink_to(path.name)
+            source = alias
+        except OSError:
+            alias = None
+    try:
+        run(["nmcli", "connection", "import", "type", "openvpn", "file", str(source)])
+    finally:
+        if alias is not None:
+            alias.unlink(missing_ok=True)
+
+    after = nm_connections()
+    imported = [uuid for uuid in after if uuid not in before and after[uuid]["type"] == "vpn"]
+    if len(imported) != 1:
+        raise WidgetError("NetworkManager imported the profile but its UUID could not be identified")
+    uuid = imported[0]
+
+    blobs: list[str] = []
+    if alias is not None:
+        prefix = f"{alias.stem}-"
+        blobs = sorted({value for value in nm_vpn_data(uuid).values() if Path(value).name.startswith(prefix)})
+    return uuid, blobs
+
+
+def ensure_imported(path: Path, state: dict[str, dict[str, Any]], info: ConfigInfo, fallback_name: str) -> dict[str, Any]:
+    key = str(path)
+    connections = nm_connections()
+    existing = state.get(key, {})
+    if existing.get("uuid") in connections:
+        return existing
+
+    uuid, blobs = import_profile(path, info)
+    # A custom name can be assigned before the profile is first imported.
+    connection_name = existing.get("name") or unique_connection_name(fallback_name, connections)
+    run(["nmcli", "connection", "modify", "uuid", uuid, "connection.id", connection_name])
+    state[key] = {**existing, "uuid": uuid, "blobs": blobs}
+    save_state(state)
+    return state[key]
+
+
+def display_name(path: Path, record: dict[str, Any], config_dir: str | None) -> str:
+    return record.get("name") or default_name(path, expand_directory(config_dir) if config_dir else None)
+
+
+def remove_blobs(record: dict[str, Any], path: Path) -> None:
+    prefix = f"{import_alias(path).stem}-"
+    for raw in record.get("blobs", []):
+        blob = Path(raw)
+        # Only ever delete files NetworkManager wrote for this profile's import.
+        if blob.name.startswith(prefix) and blob.is_file():
+            blob.unlink(missing_ok=True)
+
+
+def command_list(args: argparse.Namespace) -> None:
+    directory = expand_directory(args.config_dir)
+    state = load_state()
+    connections = nm_connections()
+    secrets = stored_secret_index()
+    changed = False
+    profiles = []
+
+    for path in discover(directory):
+        record = state.get(str(path), {})
+        uuid = record.get("uuid", "")
+        if uuid and uuid not in connections:
+            # The NetworkManager profile was deleted elsewhere. Keep the custom
+            # name, and the blob list so Forget can still clean those files up.
+            record = {key: value for key, value in record.items() if key in {"name", "blobs"} and value}
+            if record:
+                state[str(path)] = record
+            else:
+                state.pop(str(path), None)
+            uuid = ""
+            changed = True
+
+        info = inspect_config(path)
+        key = config_key(path)
+        required = info.required_secrets
+        stored = [name for name in SECRET_FIELDS if key in secrets.get(name, set())]
+        connection = connections.get(uuid)
+        profiles.append(
+            {
+                "path": str(path),
+                "fileName": path.name,
+                "relativePath": str(path.relative_to(directory)) if path.is_relative_to(directory) else path.name,
+                "name": record.get("name") or default_name(path, directory),
+                "customName": bool(record.get("name")),
+                "uuid": uuid,
+                "imported": bool(uuid),
+                "state": connection.get("state", "") if connection else "",
+                "active": is_up(connection),
+                "auth": info.auth,
+                "pkcs12": info.pkcs12,
+                "requiredSecrets": required,
+                "storedSecrets": stored,
+                "hasSecrets": all(name in stored for name in required),
+                "problems": info.problems,
+            }
+        )
+
+    if changed:
+        save_state(state)
+    emit({"ok": True, "directory": str(directory), "directoryExists": directory.is_dir(), "profiles": profiles})
+
+
+def read_payload() -> dict[str, Any]:
+    try:
+        payload = json.loads(sys.stdin.readline() or "{}")
+    except json.JSONDecodeError as error:
+        raise WidgetError("Invalid payload") from error
+    if not isinstance(payload, dict):
+        raise WidgetError("Invalid payload")
+    return payload
+
+
+def command_save_credentials(args: argparse.Namespace) -> None:
+    path = require_config(args.config)
+    info = inspect_config(path)
+    required = info.required_secrets
+    if not required:
+        raise WidgetError("This profile does not need any credentials")
+
+    payload = read_payload()
+    values = {
+        "username": str(payload.get("username", "")).strip(),
+        "password": str(payload.get("password", "")),
+        "cert-pass": str(payload.get("passphrase", "")),
+    }
+    for name in required:
+        if not values[name]:
+            raise WidgetError(f"The {SECRET_LABELS[name]} is required")
+        if any(character in values[name] for character in "\0\r\n"):
+            raise WidgetError(f"The {SECRET_LABELS[name]} cannot contain line breaks")
+    for name in required:
+        secret_store(path, name, values[name])
+    emit({"ok": True, "message": f"Credentials saved for {path.stem}"})
+
+
+def command_rename(args: argparse.Namespace) -> None:
+    path = require_config(args.config)
+    name = str(read_payload().get("name", "")).strip()
+    if not name:
+        raise WidgetError("Profile name is required")
+
+    state = load_state()
+    record = state.setdefault(str(path), {})
+    uuid = record.get("uuid", "")
+    if uuid:
+        if uuid in nm_connections():
+            run(["nmcli", "connection", "modify", "uuid", uuid, "connection.id", name])
+        else:
+            record.pop("uuid", None)
+    record["name"] = name
+    save_state(state)
+    emit({"ok": True, "message": f"Profile renamed to {name}"})
+
+
+def disconnect_managed(state: dict[str, dict[str, Any]], *, keep: Path | None = None) -> list[str]:
+    connections = nm_connections()
+    stopped = []
+    for config, record in state.items():
+        connection = connections.get(record.get("uuid", ""))
+        if config != str(keep) and is_up(connection):
+            run(["nmcli", "connection", "down", "uuid", connection["uuid"]], check=False)
+            stopped.append(record.get("name") or connection["name"])
+    return stopped
+
+
+def command_connect(args: argparse.Namespace) -> None:
+    path = require_config(args.config)
+    info = inspect_config(path)
+    if info.problems:
+        raise WidgetError(info.problems[0])
+
+    required = info.required_secrets
+    secrets = {name: secret_lookup(path, name) for name in required}
+    missing = [SECRET_LABELS[name] for name in required if not secrets[name]]
+    if missing:
+        raise WidgetError(f"Save the {' and '.join(missing)} before connecting")
+
+    state = load_state()
+    name = display_name(path, state.get(str(path), {}), args.config_dir)
+    record = ensure_imported(path, state, info, name)
+    uuid = record["uuid"]
+    stopped = disconnect_managed(state, keep=path) if args.exclusive else []
+
+    modify = []
+    if "username" in secrets:
+        modify += ["vpn.user-name", secrets["username"]]
+    flags = [f"{name}-flags={SECRET_FLAG_NOT_SAVED}" for name in required if name != "username"]
+    if flags:
+        # Imports only mark secrets agent-owned when they can tell a key is
+        # encrypted, and never for inline keys; be explicit so nmcli's
+        # passwd-file is consulted and NetworkManager never stores them.
+        modify += ["+vpn.data", ", ".join(flags)]
+    if modify:
+        run(["nmcli", "connection", "modify", "uuid", uuid, *modify])
+
+    password_file = ""
+    try:
+        command = ["nmcli", "connection", "up", "uuid", uuid]
+        lines = [f"vpn.secrets.{name}:{escape_secret(value)}\n" for name, value in secrets.items() if name != "username"]
+        if lines:
+            descriptor, password_file = tempfile.mkstemp(prefix="openvpn-plugin-", text=True)
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w") as stream:
+                stream.writelines(lines)
+            command += ["passwd-file", password_file]
+        run(command)
+    finally:
+        # The username is persisted only long enough to activate the profile.
+        # The active connection keeps its own snapshot; the saved profile goes
+        # back to having every credential exclusively in Secret Service.
+        if "username" in secrets:
+            run(["nmcli", "connection", "modify", "uuid", uuid, "vpn.user-name", ""], check=False)
+        if password_file:
+            Path(password_file).unlink(missing_ok=True)
+
+    message = f"Connected to {name}"
+    if stopped:
+        message += f" (disconnected {', '.join(stopped)})"
+    emit({"ok": True, "message": message})
+
+
+def command_disconnect(args: argparse.Namespace) -> None:
+    path = require_config(args.config)
+    record = load_state().get(str(path), {})
+    if not record.get("uuid"):
+        raise WidgetError("The profile is not imported")
+    run(["nmcli", "connection", "down", "uuid", record["uuid"]])
+    emit({"ok": True, "message": f"Disconnected from {display_name(path, record, args.config_dir)}"})
+
+
+def command_disconnect_all(_args: argparse.Namespace) -> None:
+    stopped = disconnect_managed(load_state())
+    emit({"ok": True, "message": f"Disconnected {', '.join(stopped)}" if stopped else "No profile was connected"})
+
+
+def command_forget(args: argparse.Namespace) -> None:
+    path = require_config(args.config)
+    state = load_state()
+    record = state.pop(str(path), {})
+    if record.get("uuid"):
+        run(["nmcli", "connection", "delete", "uuid", record["uuid"]], check=False)
+    remove_blobs(record, path)
+    secret_clear(path)
+    save_state(state)
+    emit({"ok": True, "message": f"Removed {path.stem} credentials and imported profile"})
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description=__doc__)
+    subparsers = root.add_subparsers(dest="command", required=True)
+
+    list_parser = subparsers.add_parser("list")
+    list_parser.add_argument("--config-dir", default="~/.config/openvpn")
+    list_parser.set_defaults(handler=command_list)
+
+    subparsers.add_parser("disconnect-all").set_defaults(handler=command_disconnect_all)
+
+    for name, handler in (
+        ("save-credentials", command_save_credentials),
+        ("rename", command_rename),
+        ("connect", command_connect),
+        ("disconnect", command_disconnect),
+        ("forget", command_forget),
+    ):
+        action_parser = subparsers.add_parser(name)
+        action_parser.add_argument("--config", required=True)
+        action_parser.add_argument("--config-dir", help="profile directory, used to derive default names")
+        if name == "connect":
+            action_parser.add_argument(
+                "--exclusive",
+                action="store_true",
+                help="disconnect other profiles managed by the plugin first",
+            )
+        action_parser.set_defaults(handler=handler)
+    return root
+
+
+def main() -> None:
+    args = parser().parse_args()
+    try:
+        args.handler(args)
+    except WidgetError as error:
+        emit({"ok": False, "error": str(error)}, 1)
+    except Exception as error:  # Keep unexpected failures visible without exposing a traceback in the panel.
+        emit({"ok": False, "error": f"Unexpected backend error: {error}"}, 1)
+
+
+if __name__ == "__main__":
+    main()

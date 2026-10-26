@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "rmarchei.openvpn",
+  "name": "OpenVPN Profiles",
+  "version": "0.1.0",
+  "author": "rmarchei",
+  "license": "MIT",
+  "description": "Manage multiple NetworkManager OpenVPN profiles from the Omarchy bar, with password, certificate, and certificate + password authentication backed by the system keyring.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OpenVPN Profiles",
+    "description": "Connect and disconnect OpenVPN profiles using passwords, client certificates, or both.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "configDirectory": "~/.config/openvpn",
+      "refreshIntervalSec": 10,
+      "singleConnection": true
+    },
+    "schema": [
+      {
+        "key": "configDirectory",
+        "type": "path",
+        "label": "OpenVPN configuration directory",
+        "defaultValue": "~/.config/openvpn",
+        "description": "Directory containing .ovpn or .conf files, directly or one folder deep. Files are imported into NetworkManager only when used."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 10
+      },
+      {
+        "key": "singleConnection",
+        "type": "boolean",
+        "label": "One connection at a time",
+        "description": "Disconnect other OpenVPN profiles before connecting a new one. Turn off to keep several profiles connected at once.",
+        "defaultValue": true
+      }
+    ]
+  }
+}

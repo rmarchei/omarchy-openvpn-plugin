@@ -83,7 +83,7 @@ The installer validates the plugin, installs the packages above, copies the plug
        └── lab.p12
    ```
 
-   You can choose a different directory in the Omarchy bar settings.
+   You can choose a different directory in the Omarchy bar settings. If the directory does not exist yet, the panel offers a **Create directory** button, which creates it with `0700` permissions.
 2. Click the shield icon in the bar. Each profile shows its auth type and whether it is ready.
 3. Click a profile, or its connect icon. If secrets are missing, the panel asks for exactly the fields that profile needs and saves them to the keyring before connecting.
 

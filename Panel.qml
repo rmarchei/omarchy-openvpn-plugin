@@ -25,6 +25,7 @@ Panel {
   readonly property bool connecting: actionKind === "connect" || activeProfiles.some(function(profile) { return profile.state === "activating" })
 
   property var profiles: []
+  property bool directoryExists: true
   property string editPath: ""
   property string editName: ""
   property var editFields: []
@@ -158,6 +159,7 @@ Panel {
 
   function actionCommand(kind, path) {
     if (kind === "disconnect-all") return [helperPath, kind]
+    if (kind === "create-directory") return [helperPath, kind, "--config-dir", configDirectory]
     var command = [helperPath, kind, "--config", path, "--config-dir", configDirectory]
     if (kind === "connect" && singleConnection) command.push("--exclusive")
     return command
@@ -234,10 +236,8 @@ Panel {
       var result = root.parseResult(listOutput.text)
       if (exitCode === 0 && result.ok) {
         root.profiles = result.profiles || []
-        if (!result.directoryExists)
-          root.errorMessage = "Configuration directory not found: " + result.directory
-        else if (root.errorMessage.indexOf("Configuration directory not found:") === 0)
-          root.errorMessage = ""
+        // A missing directory is the normal first-run state, not an error.
+        root.directoryExists = result.directoryExists !== false
       } else {
         root.errorMessage = result.error || String(listError.text || "Could not load OpenVPN profiles").trim()
       }
@@ -400,12 +400,25 @@ Panel {
           Text {
             visible: root.profiles.length === 0 && root.errorMessage === ""
             width: parent.width
-            text: "No .ovpn or .conf files found. Choose a directory in the widget settings."
+            text: root.directoryExists
+              ? "No .ovpn or .conf files found. Add some to this directory or choose another one in the widget settings."
+              : "This directory does not exist yet. Create it and add your .ovpn or .conf files, or choose another directory in the widget settings."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
             wrapMode: Text.WordWrap
             horizontalAlignment: Text.AlignHCenter
+          }
+
+          Button {
+            visible: !root.directoryExists && root.profiles.length === 0 && root.errorMessage === ""
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "Create directory"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            bordered: true
+            enabled: !actionProcess.running
+            onClicked: root.runAction("create-directory", "")
           }
 
           Column {

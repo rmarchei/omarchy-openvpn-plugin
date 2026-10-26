@@ -134,6 +134,21 @@ class DiscoveryTests(TempDirTestCase):
         self.assertEqual(module.default_name(self.root / "client.ovpn", self.root), "client")
         self.assertEqual(module.default_name(self.root / "office" / "berlin.ovpn", self.root), "berlin")
 
+    def test_create_directory_is_private_and_idempotent(self):
+        target = self.root / "config" / "openvpn"
+        args = type("Args", (), {"config_dir": str(target)})()
+        for _attempt in range(2):
+            with patch("sys.stdout", io.StringIO()) as output, self.assertRaises(SystemExit):
+                module.command_create_directory(args)
+            self.assertTrue(json.loads(output.getvalue())["ok"])
+        self.assertTrue(target.is_dir())
+        self.assertEqual(target.stat().st_mode & 0o077, 0)
+
+    def test_create_directory_refuses_to_replace_a_file(self):
+        target = self.write("openvpn")
+        with self.assertRaisesRegex(module.WidgetError, "is not a directory"):
+            module.command_create_directory(type("Args", (), {"config_dir": str(target)})())
+
     def test_config_key_is_stable(self):
         path = self.write("vpn.ovpn")
         self.assertEqual(module.config_key(path), module.config_key(path.resolve()))

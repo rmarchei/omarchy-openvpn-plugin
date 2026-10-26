@@ -630,6 +630,15 @@ def command_disconnect_all(_args: argparse.Namespace) -> None:
     emit({"ok": True, "message": f"Disconnected {', '.join(stopped)}" if stopped else "No profile was connected"})
 
 
+def command_create_directory(args: argparse.Namespace) -> None:
+    directory = expand_directory(args.config_dir)
+    if directory.exists() and not directory.is_dir():
+        raise WidgetError(f"{directory} exists and is not a directory")
+    # Private: profiles in here usually reference client keys.
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    emit({"ok": True, "message": f"Created {directory}. Add your .ovpn or .conf files there."})
+
+
 def command_forget(args: argparse.Namespace) -> None:
     path = require_config(args.config)
     state = load_state()
@@ -651,6 +660,10 @@ def parser() -> argparse.ArgumentParser:
     list_parser.set_defaults(handler=command_list)
 
     subparsers.add_parser("disconnect-all").set_defaults(handler=command_disconnect_all)
+
+    create_parser = subparsers.add_parser("create-directory")
+    create_parser.add_argument("--config-dir", default="~/.config/openvpn")
+    create_parser.set_defaults(handler=command_create_directory)
 
     for name, handler in (
         ("save-credentials", command_save_credentials),

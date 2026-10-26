@@ -27,11 +27,12 @@ Inspired by and based on [debba/omarchy-openvpn-widget](https://github.com/debba
 
 ## Security
 
-Secrets are never stored in `shell.json`, the plugin state file, NetworkManager profiles, or command-line arguments.
+Passwords and private key passphrases are never stored in `shell.json`, the plugin state file, NetworkManager profiles, or command-line arguments.
 
 - Usernames, passwords, and private key passphrases are Secret Service items (`secret-tool`, attribute `service=omarchy-openvpn-plugin`).
-- On connect, secrets go to NetworkManager through a temporary `0600` `passwd-file`, which is deleted immediately afterwards. Values are escaped for nmcli, so passwords with spaces or backslashes work.
-- Each secret's flag is set to "not saved", so NetworkManager never writes it to `/etc/NetworkManager/system-connections`. The username is set only for the duration of the activation.
+- On connect, passwords and passphrases go to NetworkManager through a temporary `0600` `passwd-file`, which is deleted immediately afterwards. Values are escaped for nmcli, so passwords with spaces or backslashes work.
+- Their flags are set to "not saved", so NetworkManager never writes them to `/etc/NetworkManager/system-connections`.
+- The username is not a secret to NetworkManager, and nmcli can only set it from a command-line argument. On connect it is therefore briefly visible to other local processes, and it stays in the NetworkManager profile only for the duration of the activation.
 - Refreshing only reads keyring item *attributes*, so a locked keyring does not prompt until you actually connect.
 - The profile directory is created automatically (`0700`). On every refresh, the directory, each profile, the certificate and key files it references inside the directory, and the folders holding them lose group and other access. Owner permissions are kept, so helper scripts stay executable. Files you don't own, symlinks, and anything outside the directory are left alone.
 

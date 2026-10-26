@@ -41,7 +41,7 @@ The local state file is `~/.local/state/omarchy-openvpn-plugin/profiles.json`. I
 ## What you need
 
 - Omarchy 4.x (Quickshell plugin API)
-- The system Python, `/usr/bin/python3` 3.10+. The backend uses it explicitly, so mise, pyenv or Homebrew Pythons earlier on your `PATH` don't matter.
+- The system Python, `/usr/bin/python3` 3.14+, which is what Omarchy ships. The backend uses it explicitly, so mise, pyenv or Homebrew Pythons earlier on your `PATH` don't matter.
 - NetworkManager, running (`systemctl is-active NetworkManager`)
 - `openvpn` and `networkmanager-openvpn`
 - `libsecret` (for `secret-tool`) and a running Secret Service provider such as GNOME Keyring. Only needed for profiles that use a password or an encrypted key.

@@ -291,7 +291,7 @@ class ImportTests(TempDirTestCase):
 
 
 class ConnectTests(TempDirTestCase):
-    def connect(self, path, state, secrets, exclusive=False):
+    def connect(self, path, state, secrets, exclusive=False, split_tunnel=False):
         written = {}
 
         def fake_run(command, **_kwargs):
@@ -299,10 +299,15 @@ class ConnectTests(TempDirTestCase):
                 written["lines"] = Path(command[command.index("passwd-file") + 1]).read_text()
             return type("Result", (), {"stdout": "", "returncode": 0})()
 
-        args = type("Args", (), {"config": str(path), "config_dir": str(self.root), "exclusive": exclusive})()
+        args = type(
+            "Args",
+            (),
+            {"config": str(path), "config_dir": str(self.root), "exclusive": exclusive, "split_tunnel": split_tunnel},
+        )()
         with (
             patch.object(module, "secret_lookup", side_effect=lambda _path, name: secrets.get(name, "")),
             patch.object(module, "load_state", return_value=state),
+            patch.object(module, "save_state", side_effect=lambda saved: written.setdefault("states", []).append(json.dumps(saved))),
             patch.object(
                 module, "nm_connections", return_value={**connection("u1", "OpenVPN · c"), **connection("u2", "Other", "activated")}
             ),
@@ -340,6 +345,37 @@ class ConnectTests(TempDirTestCase):
         commands = [entry.args[0] for entry in run.call_args_list]
         self.assertEqual(commands, [["nmcli", "connection", "down", "uuid", "u2"], ["nmcli", "connection", "up", "uuid", "u1"]])
         self.assertIn("disconnected Other", result["message"])
+
+    def test_split_tunnel_keeps_the_vpn_off_the_default_route(self):
+        path = self.write("c.ovpn", CLIENT + "<cert>\nC\n</cert>\n<key>\n" + PLAIN_PEM + "</key>\n")
+        run, written, _result = self.connect(path, {str(path): {"uuid": "u1"}}, {}, split_tunnel=True)
+        commands = [entry.args[0] for entry in run.call_args_list]
+        self.assertEqual(
+            commands[0],
+            ["nmcli", "connection", "modify", "uuid", "u1", "ipv4.never-default", "yes", "ipv6.never-default", "yes"],
+        )
+        self.assertEqual([json.loads(state) for state in written["states"]], [{str(path): {"uuid": "u1", "splitTunnel": True}}])
+
+    def test_split_tunnel_already_applied_does_not_rewrite_state(self):
+        path = self.write("c.ovpn", CLIENT + "<cert>\nC\n</cert>\n<key>\n" + PLAIN_PEM + "</key>\n")
+        run, written, _result = self.connect(path, {str(path): {"uuid": "u1", "splitTunnel": True}}, {}, split_tunnel=True)
+        self.assertIn("ipv4.never-default", run.call_args_list[0].args[0])
+        self.assertNotIn("states", written)
+
+    def test_turning_split_tunnel_off_restores_only_profiles_it_changed(self):
+        path = self.write("c.ovpn", CLIENT + "<cert>\nC\n</cert>\n<key>\n" + PLAIN_PEM + "</key>\n")
+        run, written, _result = self.connect(path, {str(path): {"uuid": "u1", "splitTunnel": True}}, {})
+        commands = [entry.args[0] for entry in run.call_args_list]
+        self.assertEqual(
+            commands[0],
+            ["nmcli", "connection", "modify", "uuid", "u1", "ipv4.never-default", "no", "ipv6.never-default", "no"],
+        )
+        self.assertEqual([json.loads(state) for state in written["states"]], [{str(path): {"uuid": "u1"}}])
+
+        # A profile the plugin never split is left to whatever the user chose.
+        run, written, _result = self.connect(path, {str(path): {"uuid": "u1"}}, {})
+        self.assertEqual(run.call_args_list, [call(["nmcli", "connection", "up", "uuid", "u1"])])
+        self.assertNotIn("states", written)
 
     def test_problems_and_missing_secrets_stop_before_networkmanager(self):
         missing_file = self.write("a.ovpn", CLIENT + "pkcs12 missing.p12\n")

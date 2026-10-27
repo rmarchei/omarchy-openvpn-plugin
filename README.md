@@ -141,6 +141,15 @@ omarchy-shell rmarchei.openvpn disconnectAll
 | `configDirectory` | `~/.config/openvpn` | Directory containing OpenVPN profiles (scanned one folder deep) |
 | `refreshIntervalSec` | `10` | Connection-state refresh interval in seconds |
 | `singleConnection` | `true` | Disconnect other profiles before connecting a new one |
+| `splitTunnel` | `false` | Route only the networks the VPN pushes through it, instead of all traffic |
+
+NetworkManager makes an OpenVPN connection the default route, and its DNS the
+default resolver, unless the profile says otherwise, even when the server only
+pushes specific routes. `splitTunnel` sets `ipv4.never-default` and
+`ipv6.never-default` on each profile when it connects, so other traffic stays on
+your normal connection and the VPN's DNS answers only for the domains it
+pushes. Turning it off again restores profiles it changed on their next
+connect, and leaves profiles you split by hand alone.
 
 ## Development
 

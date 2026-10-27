@@ -20,6 +20,7 @@ Panel {
   readonly property string configDirectory: String(setting("configDirectory", "~/.config/openvpn"))
   readonly property int refreshIntervalSec: Math.max(5, Number(setting("refreshIntervalSec", 10)) || 10)
   readonly property bool singleConnection: setting("singleConnection", true) !== false
+  readonly property bool splitTunnel: setting("splitTunnel", false) === true
   readonly property var activeProfiles: profiles.filter(function(profile) { return profile.active })
   readonly property bool anyActive: activeProfiles.length > 0
   readonly property bool connecting: actionKind === "connect" || activeProfiles.some(function(profile) { return profile.state === "activating" })
@@ -204,6 +205,7 @@ Panel {
     if (kind === "add-profile") return [helperPath, kind, "--source", path, "--config-dir", configDirectory]
     var command = [helperPath, kind, "--config", path, "--config-dir", configDirectory]
     if (kind === "connect" && singleConnection) command.push("--exclusive")
+    if (kind === "connect" && splitTunnel) command.push("--split-tunnel")
     return command
   }
 

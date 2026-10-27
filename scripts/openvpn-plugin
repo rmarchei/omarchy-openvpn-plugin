@@ -690,8 +690,21 @@ def command_connect(args: argparse.Namespace) -> None:
         # encrypted, and never for inline keys; be explicit so nmcli's
         # passwd-file is consulted and NetworkManager never stores them.
         modify += ["+vpn.data", ", ".join(flags)]
+    # NetworkManager makes a VPN the default route unless told otherwise,
+    # whatever routes the server pushes. Turning split tunneling back off
+    # undoes only what it set, so a profile split by hand keeps its routing.
+    split_changed = False
+    if args.split_tunnel:
+        modify += ["ipv4.never-default", "yes", "ipv6.never-default", "yes"]
+        split_changed = not record.get("splitTunnel")
+        record["splitTunnel"] = True
+    elif record.pop("splitTunnel", False):
+        modify += ["ipv4.never-default", "no", "ipv6.never-default", "no"]
+        split_changed = True
     if modify:
         run(["nmcli", "connection", "modify", "uuid", uuid, *modify])
+    if split_changed:
+        save_state(state)
 
     password_file = ""
     try:
@@ -1095,6 +1108,11 @@ def parser() -> argparse.ArgumentParser:
                 "--exclusive",
                 action="store_true",
                 help="disconnect other profiles managed by the plugin first",
+            )
+            action_parser.add_argument(
+                "--split-tunnel",
+                action="store_true",
+                help="route only the networks the VPN pushes, not all traffic",
             )
         action_parser.set_defaults(handler=handler)
     return root

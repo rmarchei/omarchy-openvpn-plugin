@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "rmarchei.openvpn",
   "name": "OpenVPN Profiles",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "rmarchei",
   "license": "MIT",
   "description": "Manage multiple NetworkManager OpenVPN profiles from the Omarchy bar, with password, certificate, and certificate + password authentication backed by the system keyring.",
@@ -19,7 +19,8 @@
     "defaults": {
       "configDirectory": "~/.config/openvpn",
       "refreshIntervalSec": 10,
-      "singleConnection": true
+      "singleConnection": true,
+      "splitTunnel": false
     },
     "schema": [
       {
@@ -44,6 +45,13 @@
         "label": "One connection at a time",
         "description": "Disconnect other OpenVPN profiles before connecting a new one. Turn off to keep several profiles connected at once.",
         "defaultValue": true
+      },
+      {
+        "key": "splitTunnel",
+        "type": "boolean",
+        "label": "Route only the VPN's networks",
+        "description": "Send only the routes the VPN pushes through it and keep other traffic on your normal connection. Applies on the next connect. Off leaves routing to NetworkManager, which sends all traffic through the VPN by default.",
+        "defaultValue": false
       }
     ]
   }
